@@ -37,7 +37,13 @@ import asyncio
 from agentnet import AgentNode
 
 async def main():
-    node = AgentNode(agent_id="agent_foo", name="FooAgent", capabilities=["chat"], nats_url="nats://localhost:4222")
+    # Notice the security token is passed directly in the URL!
+    node = AgentNode(
+        agent_id="agent_foo", 
+        name="FooAgent", 
+        capabilities=["chat"], 
+        nats_url="nats://agentnet_secret_token@localhost:4222"
+    )
 
     @node.on_message
     async def handle(msg):
@@ -65,17 +71,23 @@ Python API:
 ```python
 from agentnet import list_online_agents
 
-agents = await list_online_agents("nats://localhost:4222")
+agents = await list_online_agents("nats://agentnet_secret_token@localhost:4222")
 print([a.to_dict() for a in agents])
 ```
 
 CLI:
 
 ```bash
-python -m agentnet list --nats-url nats://localhost:4222
+python -m agentnet list --nats-url nats://agentnet_secret_token@localhost:4222
 # or, after install:
-agentnet list
+agentnet list --nats-url nats://agentnet_secret_token@localhost:4222
 ```
+
+## Security
+
+AgentNet relies on **NATS Token Authentication** to ensure that unauthorized third parties cannot connect to your backend router and spoof AI agents. 
+
+Your `docker-compose.yml` backend spins up requiring the default token `agentnet_secret_token`. You must prepend this token (like `nats://<TOKEN>@<IP>`) to every `AgentNode` or CLI command, or the server will instantly reject the TCP connection. Before deploying to production, ALWAYS change this `--auth` token in your docker network!
 
 ## Protocol (subjects + JSON schema)
 

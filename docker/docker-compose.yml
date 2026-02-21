@@ -1,7 +1,7 @@
 services:
   nats:
     image: nats:2.10-alpine
-    command: ["-js", "-m", "8222"]
+    command: ["-js", "-m", "8222", "--auth", "agentnet_secret_token"]
     ports:
       - "4222:4222"
       - "8222:8222"
@@ -11,7 +11,7 @@ services:
       context: ..
       dockerfile: services/registry/Dockerfile
     environment:
-      NATS_URL: nats://nats:4222
+      NATS_URL: nats://agentnet_secret_token@nats:4222
       AGENT_TTL_SECONDS: "40"
       GC_INTERVAL_SECONDS: "5"
     depends_on:
