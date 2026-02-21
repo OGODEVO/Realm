@@ -7,12 +7,13 @@ from typing import Any
 from nats.aio.client import Client as NATS
 from nats.errors import NoServersError, TimeoutError
 
+from agentnet.config import DEFAULT_NATS_URL
 from agentnet.schema import AgentInfo
 from agentnet.subjects import REGISTRY_LIST_SUBJECT
 from agentnet.utils import decode_json, encode_json
 
 
-async def list_online_agents(nats_url: str = "nats://localhost:4222", timeout: float = 2.0) -> list[AgentInfo]:
+async def list_online_agents(nats_url: str = DEFAULT_NATS_URL, timeout: float = 2.0) -> list[AgentInfo]:
     nc = NATS()
     try:
         await nc.connect(

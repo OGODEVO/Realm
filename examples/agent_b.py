@@ -1,6 +1,7 @@
 import asyncio
 
 from agentnet import AgentNode
+from agentnet.config import DEFAULT_NATS_URL
 
 
 async def main() -> None:
@@ -8,12 +9,12 @@ async def main() -> None:
         agent_id="agent_b",
         name="Agent B",
         capabilities=["receive", "notify"],
-        nats_url="nats://localhost:4222",
+        nats_url=DEFAULT_NATS_URL,
     )
 
     @node.on_message
     async def on_message(msg):
-        print(f"[agent_b] from={msg.from_agent} payload={msg.payload}")
+        print(f"[agent_b] from={msg.from_agent} session={msg.from_session_tag} payload={msg.payload}")
 
     print("agent_b online; waiting for messages")
     await node.start_forever()

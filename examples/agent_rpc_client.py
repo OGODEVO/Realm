@@ -2,6 +2,7 @@ import asyncio
 import os
 
 from agentnet import AgentNode
+from agentnet.config import DEFAULT_NATS_URL
 
 
 async def main() -> None:
@@ -9,7 +10,7 @@ async def main() -> None:
     node = AgentNode(
         agent_id="agent_client",
         name="Client Node",
-        nats_url=os.getenv("NATS_URL", "nats://localhost:4222"),
+        nats_url=os.getenv("NATS_URL", DEFAULT_NATS_URL),
     )
     
     await node.start()
@@ -22,7 +23,10 @@ async def main() -> None:
     try:
         # Notice we don't specify *which* agent should do it, only the capability 'calculator'
         reply = await node.request_capability("calculator", payload, timeout=2.0)
-        print(f"[{node.agent_id}] Received reply from {reply.from_agent}: {reply.payload}")
+        print(
+            f"[{node.agent_id}] Received reply from {reply.from_agent} "
+            f"(session={reply.from_session_tag}): {reply.payload}"
+        )
     except asyncio.TimeoutError:
         print(f"[{node.agent_id}] Request timed out. Is the calculator agent running?")
 

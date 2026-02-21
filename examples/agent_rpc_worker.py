@@ -1,10 +1,11 @@
 import asyncio
 import os
 import signal
-from typing import Any
 
 from agentnet import AgentNode
 from agentnet.schema import AgentMessage
+from agentnet.config import DEFAULT_NATS_URL
+from agentnet.utils import encode_json, new_id, utc_now_iso
 
 
 async def main() -> None:
@@ -14,7 +15,7 @@ async def main() -> None:
         agent_id="agent_calculator_1",
         name="Calculator Node",
         capabilities=["calculator"],
-        nats_url=os.getenv("NATS_URL", "nats://localhost:4222"),
+        nats_url=os.getenv("NATS_URL", DEFAULT_NATS_URL),
     )
 
     @node.on_message
@@ -28,21 +29,19 @@ async def main() -> None:
             result = x + y
             print(f"[{node.agent_id}] Calculating {x} + {y} = {result}. Sending reply.")
             
-            # Note: We simulate sending the reply by using the underlying nats connection 
-            # to publish to the reply_to subject inline. 
-            import json
             reply_envelope = {
-                "message_id": "reply_123",
+                "message_id": new_id(),
                 "from_agent": node.agent_id,
+                "from_session_tag": node.session_tag,
                 "to_agent": msg.from_agent,
                 "payload": {"result": result},
-                "sent_at": "now",
-                "kind": "reply"
+                "sent_at": utc_now_iso(),
+                "kind": "reply",
             }
-            await node._nc.publish(msg.reply_to, json.dumps(reply_envelope).encode("utf-8"))
+            await node._nc.publish(msg.reply_to, encode_json(reply_envelope))
 
     await node.start()
-    print(f"[{node.agent_id}] Started with capabilities: {node.capabilities}")
+    print(f"[{node.agent_id}] Started with session {node.session_tag} and capabilities: {node.capabilities}")
     print("Waiting for calculations...")
 
     stop_event = asyncio.Event()

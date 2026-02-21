@@ -7,6 +7,7 @@ import asyncio
 import json
 import sys
 
+from agentnet.config import DEFAULT_NATS_URL
 from agentnet.registry import list_online_agents
 from agentnet.node import AgentNode
 
@@ -64,12 +65,12 @@ def main() -> int:
 
     # List command
     list_parser = subparsers.add_parser("list", help="List currently online agents")
-    list_parser.add_argument("--nats-url", default="nats://localhost:4222")
+    list_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     list_parser.add_argument("--timeout", type=float, default=2.0)
 
     # Send command
     send_parser = subparsers.add_parser("send", help="Send a fire-and-forget message")
-    send_parser.add_argument("--nats-url", default="nats://localhost:4222")
+    send_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     group = send_parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--to", help="Agent ID to send to")
     group.add_argument("--to-capability", help="Capability to send to")
@@ -77,7 +78,7 @@ def main() -> int:
 
     # Request command
     req_parser = subparsers.add_parser("request", help="Send an RPC request and await a reply")
-    req_parser.add_argument("--nats-url", default="nats://localhost:4222")
+    req_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     req_parser.add_argument("--timeout", type=float, default=5.0)
     group2 = req_parser.add_mutually_exclusive_group(required=True)
     group2.add_argument("--to", help="Agent ID to request")

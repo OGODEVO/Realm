@@ -3,14 +3,30 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 import uuid
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+_ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def new_ulid() -> str:
+    timestamp_ms = int(time.time() * 1000)
+    randomness = int.from_bytes(os.urandom(10), "big")
+    value = (timestamp_ms << 80) | randomness
+
+    chars: list[str] = []
+    for _ in range(26):
+        chars.append(_ULID_ALPHABET[value & 0x1F])
+        value >>= 5
+    return "".join(reversed(chars))
 
 
 def utc_now_iso() -> str:

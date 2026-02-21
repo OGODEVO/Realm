@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 
+from agentnet.config import DEFAULT_NATS_URL
 from agentnet.registry import list_online_agents, list_online_agents_with_client
 from agentnet.schema import AgentInfo, AgentMessage
 from agentnet.subjects import (
     REGISTRY_GOODBYE_SUBJECT,
     REGISTRY_HELLO_SUBJECT,
+    REGISTRY_REGISTER_SUBJECT,
     agent_capability_subject,
     agent_inbox_subject,
 )
@@ -29,10 +33,21 @@ class AgentNode:
         agent_id: str,
         name: str,
         capabilities: list[str] | None = None,
-        nats_url: str = "nats://localhost:4222",
+        nats_url: str = DEFAULT_NATS_URL,
         metadata: dict[str, Any] | None = None,
         heartbeat_interval: float = 12.0,
         logger: logging.Logger | None = None,
+        max_concurrency: int = 4,
+        max_pending: int = 100,
+        max_payload_bytes: int = 256_000,
+        work_timeout_seconds: float = 30.0,
+        drain_timeout_seconds: float = 20.0,
+        default_ttl_ms: int = 30_000,
+        dedupe_ttl_seconds: float = 600.0,
+        rate_limit_per_sender_per_sec: float = 5.0,
+        rate_limit_burst: int = 10,
+        circuit_breaker_failures: int = 5,
+        circuit_breaker_reset_seconds: float = 15.0,
     ) -> None:
         self.agent_id = agent_id
         self.name = name
@@ -42,15 +57,50 @@ class AgentNode:
         self.heartbeat_interval = max(1.0, heartbeat_interval)
         self.logger = logger or logging.getLogger(f"agentnet.{agent_id}")
 
+        self.max_concurrency = max(1, max_concurrency)
+        self.max_pending = max(1, max_pending)
+        self.max_payload_bytes = max(1, max_payload_bytes)
+        self.work_timeout_seconds = max(0.1, work_timeout_seconds)
+        self.drain_timeout_seconds = max(0.1, drain_timeout_seconds)
+        self.default_ttl_ms = max(1, default_ttl_ms)
+        self.dedupe_ttl_seconds = max(1.0, dedupe_ttl_seconds)
+        self.rate_limit_per_sender_per_sec = max(0.1, rate_limit_per_sender_per_sec)
+        self.rate_limit_burst = max(1, rate_limit_burst)
+        self.circuit_breaker_failures = max(1, circuit_breaker_failures)
+        self.circuit_breaker_reset_seconds = max(1.0, circuit_breaker_reset_seconds)
+
         self._nc: NATS | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._worker_tasks: list[asyncio.Task[None]] = []
+        self._incoming_queue: asyncio.Queue[AgentMessage] | None = None
         self._message_handler: MessageHandler | None = None
+        self._accepting_messages = False
+        self.session_tag: str | None = None
+
+        self._sender_buckets: dict[str, tuple[float, float]] = {}
+        self._seen_message_ids: dict[str, float] = {}
+
+        self._consecutive_failures = 0
+        self._circuit_open_until = 0.0
+
+        self._inflight_count = 0
+        self._processed_count = 0
+        self._dropped_count = 0
+        self._timeout_count = 0
+        self._error_count = 0
+        self._rate_limited_count = 0
+        self._expired_count = 0
+        self._payload_rejected_count = 0
+        self._duplicate_count = 0
+        self._busy_count = 0
+        self._handle_time_total_ms = 0.0
 
     @property
     def info(self) -> AgentInfo:
         return AgentInfo(
             agent_id=self.agent_id,
             name=self.name,
+            session_tag=self.session_tag,
             capabilities=self.capabilities,
             metadata=self.metadata,
             last_seen=utc_now_iso(),
@@ -60,27 +110,60 @@ class AgentNode:
         self._message_handler = handler
         return handler
 
+    def metrics_snapshot(self) -> dict[str, Any]:
+        pending_count = self._incoming_queue.qsize() if self._incoming_queue is not None else 0
+        avg_ms = (self._handle_time_total_ms / self._processed_count) if self._processed_count else 0.0
+        return {
+            "agent_id": self.agent_id,
+            "session_tag": self.session_tag,
+            "inflight_count": self._inflight_count,
+            "pending_count": pending_count,
+            "processed_count": self._processed_count,
+            "dropped_count": self._dropped_count,
+            "timeout_count": self._timeout_count,
+            "error_count": self._error_count,
+            "rate_limited_count": self._rate_limited_count,
+            "expired_count": self._expired_count,
+            "payload_rejected_count": self._payload_rejected_count,
+            "duplicate_count": self._duplicate_count,
+            "busy_count": self._busy_count,
+            "avg_handle_ms": round(avg_ms, 2),
+            "circuit_open": self._is_circuit_open(),
+        }
+
     async def start(self) -> None:
         if self._nc and self._nc.is_connected:
             return
 
         self._nc = NATS()
         await self._nc.connect(servers=[self.nats_url], name=f"agentnet-{self.agent_id}")
-        await self._nc.subscribe(agent_inbox_subject(self.agent_id), cb=self._handle_inbox)
-        
-        for capability in self.capabilities:
-            await self._nc.subscribe(
-                agent_capability_subject(capability),
-                queue=f"agentnet-capability-{capability}",
-                cb=self._handle_inbox,
+        try:
+            await self._register()
+            if self._message_handler is not None:
+                self._start_workers()
+                self._accepting_messages = True
+                await self._nc.subscribe(agent_inbox_subject(self.agent_id), cb=self._handle_inbox)
+                for capability in self.capabilities:
+                    await self._nc.subscribe(
+                        agent_capability_subject(capability),
+                        queue=f"agentnet-capability-{capability}",
+                        cb=self._handle_inbox,
+                    )
+            elif self.capabilities:
+                self.logger.warning("Capabilities were provided but no message handler is set; subscriptions disabled.")
+            await self._publish_hello()
+            self._heartbeat_task = asyncio.create_task(
+                self._heartbeat_loop(),
+                name=f"agentnet-heartbeat-{self.agent_id}",
             )
-
-        await self._publish_hello()
-
-        self._heartbeat_task = asyncio.create_task(
-            self._heartbeat_loop(),
-            name=f"agentnet-heartbeat-{self.agent_id}",
-        )
+        except Exception:
+            self._accepting_messages = False
+            await self._stop_workers()
+            if self._nc and self._nc.is_connected:
+                await self._nc.drain()
+            self._nc = None
+            self.session_tag = None
+            raise
 
     async def start_forever(self) -> None:
         await self.start()
@@ -90,6 +173,9 @@ class AgentNode:
             await self.close()
 
     async def close(self) -> None:
+        self._accepting_messages = False
+        await self._stop_workers()
+
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
             try:
@@ -99,11 +185,11 @@ class AgentNode:
             self._heartbeat_task = None
 
         if not self._nc:
+            self.session_tag = None
             return
 
         nc = self._nc
         self._nc = None
-
         if nc.is_connected:
             try:
                 await self._publish_goodbye(client=nc)
@@ -111,69 +197,88 @@ class AgentNode:
                 self.logger.exception("Failed publishing registry.goodbye")
             await nc.drain()
 
-    async def send(self, to: str, payload: Any, kind: str = "direct") -> str:
-        if not self._nc or not self._nc.is_connected:
-            raise RuntimeError("AgentNode is not connected. Call start() first.")
+        self.logger.info("AgentNode shutdown metrics=%s", self.metrics_snapshot())
+        self.session_tag = None
 
-        envelope = AgentMessage(
-            message_id=new_id(),
-            from_agent=self.agent_id,
-            to_agent=to,
+    async def send(
+        self,
+        to: str,
+        payload: Any,
+        kind: str = "direct",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> str:
+        nc = self._require_connected_client()
+        envelope = self._build_outbound_message(
+            to=to,
             payload=payload,
-            sent_at=utc_now_iso(),
             kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
         )
-        await self._nc.publish(agent_inbox_subject(to), encode_json(envelope.to_dict()))
+        await nc.publish(agent_inbox_subject(to), self._encode_message(envelope))
         return envelope.message_id
 
-    async def send_to_capability(self, capability: str, payload: Any, kind: str = "direct") -> str:
-        if not self._nc or not self._nc.is_connected:
-            raise RuntimeError("AgentNode is not connected. Call start() first.")
-
-        envelope = AgentMessage(
-            message_id=new_id(),
-            from_agent=self.agent_id,
-            to_agent=f"capability:{capability}",
+    async def send_to_capability(
+        self,
+        capability: str,
+        payload: Any,
+        kind: str = "direct",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> str:
+        nc = self._require_connected_client()
+        envelope = self._build_outbound_message(
+            to=f"capability:{capability}",
             payload=payload,
-            sent_at=utc_now_iso(),
             kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
         )
-        await self._nc.publish(agent_capability_subject(capability), encode_json(envelope.to_dict()))
+        await nc.publish(agent_capability_subject(capability), self._encode_message(envelope))
         return envelope.message_id
 
-    async def request(self, to: str, payload: Any, timeout: float = 5.0, kind: str = "request") -> AgentMessage:
-        if not self._nc or not self._nc.is_connected:
-            raise RuntimeError("AgentNode is not connected. Call start() first.")
-
-        envelope = AgentMessage(
-            message_id=new_id(),
-            from_agent=self.agent_id,
-            to_agent=to,
+    async def request(
+        self,
+        to: str,
+        payload: Any,
+        timeout: float = 5.0,
+        kind: str = "request",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> AgentMessage:
+        nc = self._require_connected_client()
+        envelope = self._build_outbound_message(
+            to=to,
             payload=payload,
-            sent_at=utc_now_iso(),
             kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
         )
-        
-        reply_msg = await self._nc.request(agent_inbox_subject(to), encode_json(envelope.to_dict()), timeout=timeout)
+        reply_msg = await nc.request(agent_inbox_subject(to), self._encode_message(envelope), timeout=timeout)
         data = decode_json(reply_msg.data)
         if not isinstance(data, dict):
             raise ValueError("reply message payload must be a JSON object")
         return AgentMessage.from_dict(data)
 
-    async def request_capability(self, capability: str, payload: Any, timeout: float = 5.0, kind: str = "request") -> AgentMessage:
-        if not self._nc or not self._nc.is_connected:
-            raise RuntimeError("AgentNode is not connected. Call start() first.")
-
-        envelope = AgentMessage(
-            message_id=new_id(),
-            from_agent=self.agent_id,
-            to_agent=f"capability:{capability}",
+    async def request_capability(
+        self,
+        capability: str,
+        payload: Any,
+        timeout: float = 5.0,
+        kind: str = "request",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> AgentMessage:
+        nc = self._require_connected_client()
+        envelope = self._build_outbound_message(
+            to=f"capability:{capability}",
             payload=payload,
-            sent_at=utc_now_iso(),
             kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
         )
-        
-        reply_msg = await self._nc.request(agent_capability_subject(capability), encode_json(envelope.to_dict()), timeout=timeout)
+        reply_msg = await nc.request(agent_capability_subject(capability), self._encode_message(envelope), timeout=timeout)
         data = decode_json(reply_msg.data)
         if not isinstance(data, dict):
             raise ValueError("reply message payload must be a JSON object")
@@ -188,6 +293,12 @@ class AgentNode:
         if self._message_handler is None:
             return
 
+        if len(msg.data) > self.max_payload_bytes:
+            self._payload_rejected_count += 1
+            self._dropped_count += 1
+            self.logger.warning("Dropped oversized payload bytes=%s max=%s", len(msg.data), self.max_payload_bytes)
+            return
+
         try:
             data = decode_json(msg.data)
             if not isinstance(data, dict):
@@ -196,26 +307,336 @@ class AgentNode:
             if msg.reply:
                 message.reply_to = msg.reply
         except Exception:  # noqa: BLE001
+            self._dropped_count += 1
             self.logger.exception("Failed to decode inbox message")
             return
 
-        await self._message_handler(message)
+        now = time.monotonic()
+        self._cleanup_tracking_state(now)
+
+        if not self._accepting_messages:
+            self._busy_count += 1
+            self._dropped_count += 1
+            await self._maybe_reply_error(message, "shutting_down", "agent is shutting down")
+            return
+
+        if self._is_circuit_open(now):
+            self._busy_count += 1
+            self._dropped_count += 1
+            await self._maybe_reply_error(message, "service_degraded", "circuit breaker open")
+            return
+
+        ttl_error = self._validate_ttl(message)
+        if ttl_error is not None:
+            self._expired_count += 1
+            self._dropped_count += 1
+            await self._maybe_reply_error(message, ttl_error, "message ttl invalid or expired")
+            return
+
+        sender_key = message.from_session_tag or message.from_agent or "unknown"
+        if not self._allow_sender(sender_key, now):
+            self._rate_limited_count += 1
+            self._dropped_count += 1
+            await self._maybe_reply_error(message, "rate_limited", "sender rate exceeded")
+            return
+
+        if message.message_id and message.message_id in self._seen_message_ids:
+            self._duplicate_count += 1
+            self._dropped_count += 1
+            await self._maybe_reply_error(message, "duplicate", "message_id has already been processed")
+            return
+
+        queue = self._incoming_queue
+        if queue is None or queue.full():
+            self._busy_count += 1
+            self._dropped_count += 1
+            await self._maybe_reply_error(message, "busy", "agent backlog is full")
+            return
+
+        if message.message_id:
+            self._seen_message_ids[message.message_id] = now + self.dedupe_ttl_seconds
+        queue.put_nowait(message)
+
+    async def _worker_loop(self, worker_id: int) -> None:
+        queue = self._incoming_queue
+        if queue is None:
+            return
+
+        while True:
+            message = await queue.get()
+            self._inflight_count += 1
+            started = time.perf_counter()
+            trace_id = message.trace_id or message.message_id
+
+            try:
+                if self._is_circuit_open():
+                    await self._maybe_reply_error(message, "service_degraded", "circuit breaker open")
+                    continue
+                await asyncio.wait_for(self._message_handler(message), timeout=self.work_timeout_seconds)
+                self._processed_count += 1
+                self._record_success()
+            except asyncio.TimeoutError:
+                self._timeout_count += 1
+                self._error_count += 1
+                self._record_failure()
+                await self._maybe_reply_error(message, "timeout", "handler timed out")
+                self.logger.warning(
+                    "message timeout agent=%s session=%s worker=%s message_id=%s trace_id=%s",
+                    self.agent_id,
+                    self.session_tag,
+                    worker_id,
+                    message.message_id,
+                    trace_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                self._error_count += 1
+                self._record_failure()
+                await self._maybe_reply_error(message, "handler_error", "handler raised an exception")
+                self.logger.exception(
+                    "message handler error agent=%s session=%s worker=%s message_id=%s trace_id=%s",
+                    self.agent_id,
+                    self.session_tag,
+                    worker_id,
+                    message.message_id,
+                    trace_id,
+                )
+            finally:
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                self._handle_time_total_ms += elapsed_ms
+                self._inflight_count -= 1
+                queue.task_done()
+
+    def _start_workers(self) -> None:
+        self._incoming_queue = asyncio.Queue(maxsize=self.max_pending)
+        self._worker_tasks = [
+            asyncio.create_task(self._worker_loop(i), name=f"agentnet-worker-{self.agent_id}-{i}")
+            for i in range(self.max_concurrency)
+        ]
+
+    async def _stop_workers(self) -> None:
+        queue = self._incoming_queue
+        if queue is not None:
+            try:
+                await asyncio.wait_for(queue.join(), timeout=self.drain_timeout_seconds)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "Drain timeout agent=%s session=%s inflight=%s pending=%s",
+                    self.agent_id,
+                    self.session_tag,
+                    self._inflight_count,
+                    queue.qsize(),
+                )
+
+        for task in self._worker_tasks:
+            task.cancel()
+        if self._worker_tasks:
+            await asyncio.gather(*self._worker_tasks, return_exceptions=True)
+
+        self._worker_tasks = []
+        self._incoming_queue = None
+        self._inflight_count = 0
+
+    def _allow_sender(self, sender_key: str, now: float) -> bool:
+        tokens, last = self._sender_buckets.get(sender_key, (float(self.rate_limit_burst), now))
+        tokens = min(float(self.rate_limit_burst), tokens + (now - last) * self.rate_limit_per_sender_per_sec)
+        if tokens < 1.0:
+            self._sender_buckets[sender_key] = (tokens, now)
+            return False
+        self._sender_buckets[sender_key] = (tokens - 1.0, now)
+        return True
+
+    def _validate_ttl(self, message: AgentMessage) -> str | None:
+        now = datetime.now(UTC)
+
+        expires_at_dt = self._parse_iso_utc(message.expires_at)
+        ttl_expires_dt: datetime | None = None
+        if message.ttl_ms is not None:
+            sent_at_dt = self._parse_iso_utc(message.sent_at)
+            if sent_at_dt is not None:
+                ttl_expires_dt = sent_at_dt + timedelta(milliseconds=max(0, message.ttl_ms))
+
+        effective_expiry = self._min_datetime(expires_at_dt, ttl_expires_dt)
+        if effective_expiry is None:
+            return "missing_ttl"
+        if now >= effective_expiry:
+            return "expired"
+        return None
+
+    @staticmethod
+    def _min_datetime(first: datetime | None, second: datetime | None) -> datetime | None:
+        if first is None:
+            return second
+        if second is None:
+            return first
+        return first if first <= second else second
+
+    @staticmethod
+    def _parse_iso_utc(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        raw = value
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(raw)
+        except ValueError:
+            return None
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+
+    def _build_outbound_message(
+        self,
+        to: str,
+        payload: Any,
+        kind: str,
+        ttl_ms: int | None,
+        trace_id: str | None,
+    ) -> AgentMessage:
+        message_id = new_id()
+        sent_at = utc_now_iso()
+        effective_ttl = self.default_ttl_ms
+        if ttl_ms is not None:
+            try:
+                effective_ttl = max(1, int(ttl_ms))
+            except (TypeError, ValueError):
+                effective_ttl = self.default_ttl_ms
+        expires_at = self._build_expiry_from_sent(sent_at, effective_ttl)
+        return AgentMessage(
+            message_id=message_id,
+            from_agent=self.agent_id,
+            to_agent=to,
+            payload=payload,
+            sent_at=sent_at,
+            from_session_tag=self._require_session_tag(),
+            ttl_ms=effective_ttl,
+            expires_at=expires_at,
+            trace_id=trace_id or message_id,
+            kind=kind,
+        )
+
+    def _build_expiry_from_sent(self, sent_at: str, ttl_ms: int) -> str:
+        sent_dt = self._parse_iso_utc(sent_at) or datetime.now(UTC)
+        expires_dt = sent_dt + timedelta(milliseconds=max(1, ttl_ms))
+        return expires_dt.isoformat().replace("+00:00", "Z")
+
+    def _encode_message(self, envelope: AgentMessage) -> bytes:
+        raw = encode_json(envelope.to_dict())
+        if len(raw) > self.max_payload_bytes:
+            raise ValueError(f"message exceeds max_payload_bytes={self.max_payload_bytes}")
+        return raw
+
+    async def _maybe_reply_error(self, request: AgentMessage, code: str, detail: str) -> None:
+        nc = self._nc
+        if not request.reply_to or not nc or not nc.is_connected:
+            return
+
+        sent_at = utc_now_iso()
+        error_reply = AgentMessage(
+            message_id=new_id(),
+            from_agent=self.agent_id,
+            to_agent=request.from_agent,
+            payload={
+                "error": code,
+                "detail": detail,
+                "request_message_id": request.message_id,
+                "trace_id": request.trace_id or request.message_id,
+            },
+            sent_at=sent_at,
+            from_session_tag=self.session_tag,
+            ttl_ms=self.default_ttl_ms,
+            expires_at=self._build_expiry_from_sent(sent_at, self.default_ttl_ms),
+            trace_id=request.trace_id or request.message_id,
+            kind="error",
+        )
+        try:
+            await nc.publish(request.reply_to, self._encode_message(error_reply))
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed replying with error code=%s", code)
+
+    def _cleanup_tracking_state(self, now: float) -> None:
+        seen_cutoff_keys = [key for key, expiry in self._seen_message_ids.items() if expiry <= now]
+        for key in seen_cutoff_keys:
+            self._seen_message_ids.pop(key, None)
+
+        bucket_cutoff = now - self.dedupe_ttl_seconds
+        stale_sender_keys = [key for key, (_, ts) in self._sender_buckets.items() if ts <= bucket_cutoff]
+        for key in stale_sender_keys:
+            self._sender_buckets.pop(key, None)
+
+    def _record_success(self) -> None:
+        self._consecutive_failures = 0
+
+    def _record_failure(self) -> None:
+        self._consecutive_failures += 1
+        if self._consecutive_failures < self.circuit_breaker_failures:
+            return
+        self._circuit_open_until = time.monotonic() + self.circuit_breaker_reset_seconds
+        self._consecutive_failures = 0
+        self.logger.error(
+            "Circuit opened agent=%s session=%s reset_in_s=%s",
+            self.agent_id,
+            self.session_tag,
+            self.circuit_breaker_reset_seconds,
+        )
+
+    def _is_circuit_open(self, now: float | None = None) -> bool:
+        check = now if now is not None else time.monotonic()
+        return check < self._circuit_open_until
 
     async def _publish_hello(self, client: NATS | None = None) -> None:
         nc = client or self._nc
-        if not nc:
+        if not nc or not self.session_tag:
             return
-        payload = self.info.to_dict()
-        await nc.publish(REGISTRY_HELLO_SUBJECT, encode_json(payload))
+        await nc.publish(REGISTRY_HELLO_SUBJECT, encode_json(self.info.to_dict()))
 
     async def _publish_goodbye(self, client: NATS | None = None) -> None:
         nc = client or self._nc
         if not nc:
             return
+        session_tag = self.session_tag
+        if not session_tag:
+            return
         await nc.publish(
             REGISTRY_GOODBYE_SUBJECT,
-            encode_json({"agent_id": self.agent_id, "seen_at": utc_now_iso()}),
+            encode_json({"agent_id": self.agent_id, "session_tag": session_tag, "seen_at": utc_now_iso()}),
         )
+
+    async def _register(self, client: NATS | None = None, timeout: float = 5.0) -> None:
+        nc = client or self._nc
+        if not nc:
+            raise RuntimeError("AgentNode is not connected. Call start() first.")
+
+        response = await nc.request(REGISTRY_REGISTER_SUBJECT, encode_json(self.info.to_dict()), timeout=timeout)
+        payload = decode_json(response.data)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Registry register response payload must be a JSON object.")
+        if "error" in payload:
+            raise RuntimeError(f"Registry register failed: {payload['error']}")
+
+        session_tag = str(payload.get("session_tag") or "")
+        if not session_tag:
+            raise RuntimeError("Registry register did not return a session_tag.")
+        self.session_tag = session_tag
+
+        heartbeat_interval = payload.get("heartbeat_interval")
+        try:
+            if heartbeat_interval is not None:
+                self.heartbeat_interval = max(1.0, float(heartbeat_interval))
+        except (TypeError, ValueError):
+            pass
+
+    def _require_session_tag(self) -> str:
+        if not self.session_tag:
+            raise RuntimeError("Agent session is not registered. Call start() first.")
+        return self.session_tag
+
+    def _require_connected_client(self) -> NATS:
+        if not self._nc or not self._nc.is_connected:
+            raise RuntimeError("AgentNode is not connected. Call start() first.")
+        return self._nc
 
     async def _heartbeat_loop(self) -> None:
         while True:
@@ -225,7 +646,7 @@ class AgentNode:
             except Exception:  # noqa: BLE001
                 self.logger.exception("Failed publishing registry heartbeat")
 
-    async def __aenter__(self) -> "AgentNode":
+    async def __aenter__(self) -> AgentNode:
         await self.start()
         return self
 

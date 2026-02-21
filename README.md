@@ -8,6 +8,9 @@
 - Direct inbox per agent (`agent.<id>.inbox`)
 - Online registry with agent metadata and capabilities
 - Async-first API for scripts and long-running workers
+- Bounded in-process concurrency (worker cap + pending queue cap)
+- Safety guardrails: TTL checks, dedupe, rate limiting, work timeouts, circuit breaker
+- Durable session metadata in Postgres (`agent_sessions`)
 
 ## Quickstart
 
@@ -28,7 +31,8 @@ docker compose -f docker/docker-compose.yml up -d
 This starts:
 
 - NATS on `localhost:4222`
-- Registry service subscribed to `registry.hello`, `registry.goodbye`, and `registry.list`
+- Postgres for durable session metadata
+- Registry service subscribed to `registry.register`, `registry.hello`, `registry.goodbye`, and `registry.list`
 
 ### 3) Integrate into your agent (5-10 lines)
 
@@ -89,11 +93,27 @@ AgentNet relies on **NATS Token Authentication** to ensure that unauthorized thi
 
 Your `docker-compose.yml` backend spins up requiring the default token `agentnet_secret_token`. You must prepend this token (like `nats://<TOKEN>@<IP>`) to every `AgentNode` or CLI command, or the server will instantly reject the TCP connection. Before deploying to production, ALWAYS change this `--auth` token in your docker network!
 
+## Durable sessions
+
+Registry persists session metadata into Postgres table `agent_sessions`:
+
+- `session_tag` (PK)
+- `agent_id`
+- `server_id`
+- `connected_at`
+- `disconnected_at`
+- `last_seen`
+- `status`
+- `metadata` (JSONB)
+
+Retention is controlled by `SESSION_RETENTION_DAYS` (default: `14`). Offline sessions older than retention are pruned.
+
 ## Protocol (subjects + JSON schema)
 
 ### Subjects
 
 - Direct messages: `agent.<id>.inbox`
+- Register (request/reply): `registry.register`
 - Presence hello: `registry.hello`
 - Presence goodbye: `registry.goodbye`
 - List request: `registry.list` (request/reply)
@@ -104,9 +124,13 @@ Your `docker-compose.yml` backend spins up requiring the default token `agentnet
 {
   "message_id": "b3d0...",
   "from_agent": "agent_a",
+  "from_session_tag": "registry_01J...",
   "to_agent": "agent_b",
   "payload": {"text": "yo"},
   "sent_at": "2026-02-21T08:00:00Z",
+  "ttl_ms": 30000,
+  "expires_at": "2026-02-21T08:00:30Z",
+  "trace_id": "b3d0...",
   "kind": "direct"
 }
 ```
@@ -117,11 +141,26 @@ Your `docker-compose.yml` backend spins up requiring the default token `agentnet
 {
   "agent_id": "agent_a",
   "name": "Agent A",
+  "session_tag": "registry_01J...",
   "capabilities": ["chat", "summarize"],
   "metadata": {"team": "ops"},
   "last_seen": "2026-02-21T08:00:00Z"
 }
 ```
+
+### Register reply JSON
+
+```json
+{
+  "session_tag": "registry_01J...",
+  "heartbeat_interval": 12.0,
+  "ttl_seconds": 40.0
+}
+```
+
+`agent_id` is the logical role name. `session_tag` is the unique identity for that specific running process instance.
+
+Incoming messages without `ttl_ms` or `expires_at` are rejected by default.
 
 ## Heartbeat requirement (must-have)
 
@@ -129,6 +168,20 @@ Presence is kept accurate via heartbeat:
 
 - Agents re-publish `registry.hello` every 10-15 seconds (default: 12 seconds)
 - Registry evicts agents with no heartbeat for 30-45 seconds (default TTL: 40 seconds)
+
+## Concurrency guardrails
+
+`AgentNode` enforces bounded in-process concurrency and backpressure by default:
+
+- `max_concurrency=4`
+- `max_pending=100`
+- `work_timeout_seconds=30`
+- `max_payload_bytes=256000`
+- `rate_limit_per_sender_per_sec=5` with `rate_limit_burst=10`
+- `dedupe_ttl_seconds=600`
+- `circuit_breaker_failures=5` with `circuit_breaker_reset_seconds=15`
+
+You can override these in `AgentNode(...)` per agent process.
 
 ## Run examples
 

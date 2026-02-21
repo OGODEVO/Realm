@@ -6,14 +6,32 @@ services:
       - "4222:4222"
       - "8222:8222"
 
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: agentnet
+      POSTGRES_USER: agentnet
+      POSTGRES_PASSWORD: agentnet
+    volumes:
+      - agentnet_pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
   registry:
     build:
       context: ..
       dockerfile: services/registry/Dockerfile
     environment:
       NATS_URL: nats://agentnet_secret_token@nats:4222
+      DATABASE_URL: postgresql://agentnet:agentnet@postgres:5432/agentnet
+      SESSION_RETENTION_DAYS: "14"
       AGENT_TTL_SECONDS: "40"
+      HEARTBEAT_INTERVAL_SECONDS: "12"
       GC_INTERVAL_SECONDS: "5"
+      REGISTRY_SERVER_ID: "registry"
     depends_on:
       - nats
+      - postgres
     restart: unless-stopped
+
+volumes:
+  agentnet_pg_data:
