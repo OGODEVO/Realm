@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentnet"
+version = "0.1.0"
+description = "Minimal NATS network for agent-to-agent messaging and discovery"
+readme = "README.md"
+requires-python = ">=3.14"
+license = { text = "MIT" }
+dependencies = [
+  "nats-py>=2.8.0,<3.0.0",
+]
+
+[project.scripts]
+agentnet = "agentnet.__main__:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
