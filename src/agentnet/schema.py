@@ -10,6 +10,8 @@ from typing import Any, Mapping
 class AgentInfo:
     agent_id: str
     name: str
+    account_id: str | None = None
+    username: str | None = None
     session_tag: str | None = None
     capabilities: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -19,6 +21,8 @@ class AgentInfo:
     def from_dict(cls, data: Mapping[str, Any]) -> "AgentInfo":
         agent_id = str(data.get("agent_id") or "")
         name = str(data.get("name") or agent_id)
+        account_id = data.get("account_id")
+        username = data.get("username")
         session_tag = data.get("session_tag")
         capabilities = [str(item) for item in (data.get("capabilities") or [])]
         metadata = data.get("metadata") or {}
@@ -28,6 +32,8 @@ class AgentInfo:
         return cls(
             agent_id=agent_id,
             name=name,
+            account_id=str(account_id) if account_id else None,
+            username=str(username) if username else None,
             session_tag=str(session_tag) if session_tag else None,
             capabilities=capabilities,
             metadata=metadata,
@@ -41,6 +47,10 @@ class AgentInfo:
             "capabilities": self.capabilities,
             "metadata": self.metadata,
         }
+        if self.account_id is not None:
+            payload["account_id"] = self.account_id
+        if self.username is not None:
+            payload["username"] = self.username
         if self.session_tag is not None:
             payload["session_tag"] = self.session_tag
         if self.last_seen is not None:
@@ -55,6 +65,8 @@ class AgentMessage:
     to_agent: str
     payload: Any
     sent_at: str
+    from_account_id: str | None = None
+    to_account_id: str | None = None
     from_session_tag: str | None = None
     ttl_ms: int | None = None
     expires_at: str | None = None
@@ -77,6 +89,8 @@ class AgentMessage:
             to_agent=str(data.get("to_agent") or ""),
             payload=data.get("payload"),
             sent_at=str(data.get("sent_at") or ""),
+            from_account_id=str(data.get("from_account_id") or "") or None,
+            to_account_id=str(data.get("to_account_id") or "") or None,
             from_session_tag=str(data.get("from_session_tag") or "") or None,
             ttl_ms=ttl_ms,
             expires_at=str(data.get("expires_at") or "") or None,
@@ -96,6 +110,10 @@ class AgentMessage:
         }
         if self.from_session_tag is not None:
             payload_dict["from_session_tag"] = self.from_session_tag
+        if self.from_account_id is not None:
+            payload_dict["from_account_id"] = self.from_account_id
+        if self.to_account_id is not None:
+            payload_dict["to_account_id"] = self.to_account_id
         if self.ttl_ms is not None:
             payload_dict["ttl_ms"] = self.ttl_ms
         if self.expires_at is not None:

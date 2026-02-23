@@ -5,7 +5,6 @@ import signal
 from agentnet import AgentNode
 from agentnet.schema import AgentMessage
 from agentnet.config import DEFAULT_NATS_URL
-from agentnet.utils import encode_json, new_id, utc_now_iso
 
 
 async def main() -> None:
@@ -14,6 +13,7 @@ async def main() -> None:
     node = AgentNode(
         agent_id="agent_calculator_1",
         name="Calculator Node",
+        username="calculator_1",
         capabilities=["calculator"],
         nats_url=os.getenv("NATS_URL", DEFAULT_NATS_URL),
     )
@@ -29,16 +29,11 @@ async def main() -> None:
             result = x + y
             print(f"[{node.agent_id}] Calculating {x} + {y} = {result}. Sending reply.")
             
-            reply_envelope = {
-                "message_id": new_id(),
-                "from_agent": node.agent_id,
-                "from_session_tag": node.session_tag,
-                "to_agent": msg.from_agent,
-                "payload": {"result": result},
-                "sent_at": utc_now_iso(),
-                "kind": "reply",
-            }
-            await node._nc.publish(msg.reply_to, encode_json(reply_envelope))
+            await node.reply(
+                request=msg,
+                payload={"result": result},
+                kind="reply",
+            )
 
     await node.start()
     print(f"[{node.agent_id}] Started with session {node.session_tag} and capabilities: {node.capabilities}")

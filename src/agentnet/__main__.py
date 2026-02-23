@@ -18,7 +18,13 @@ async def _run_list(nats_url: str, timeout: float) -> int:
     return 0
 
 
-async def _run_send(nats_url: str, to: str, to_capability: str | None, payload: str) -> int:
+async def _run_send(
+    nats_url: str,
+    to_account: str | None,
+    to_username: str | None,
+    to_capability: str | None,
+    payload: str,
+) -> int:
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
@@ -29,13 +35,26 @@ async def _run_send(nats_url: str, to: str, to_capability: str | None, payload: 
         if to_capability:
             msg_id = await node.send_to_capability(to_capability, data)
             print(f"Sent message {msg_id} to capability '{to_capability}'")
+        elif to_account:
+            msg_id = await node.send_to_account(to_account, data)
+            print(f"Sent message {msg_id} to account '{to_account}'")
+        elif to_username:
+            msg_id = await node.send_to_username(to_username, data)
+            print(f"Sent message {msg_id} to username '{to_username}'")
         else:
-            msg_id = await node.send(to, data)
-            print(f"Sent message {msg_id} to agent '{to}'")
+            print("Error: one destination option is required", file=sys.stderr)
+            return 1
     return 0
 
 
-async def _run_request(nats_url: str, to: str, to_capability: str | None, payload: str, timeout: float) -> int:
+async def _run_request(
+    nats_url: str,
+    to_account: str | None,
+    to_username: str | None,
+    to_capability: str | None,
+    payload: str,
+    timeout: float,
+) -> int:
     try:
         data = json.loads(payload)
     except json.JSONDecodeError:
@@ -47,9 +66,15 @@ async def _run_request(nats_url: str, to: str, to_capability: str | None, payloa
             if to_capability:
                 print(f"Requesting capability '{to_capability}'...")
                 reply = await node.request_capability(to_capability, data, timeout=timeout)
+            elif to_account:
+                print(f"Requesting account '{to_account}'...")
+                reply = await node.request_account(to_account, data, timeout=timeout)
+            elif to_username:
+                print(f"Requesting username '{to_username}'...")
+                reply = await node.request_username(to_username, data, timeout=timeout)
             else:
-                print(f"Requesting agent '{to}'...")
-                reply = await node.request(to, data, timeout=timeout)
+                print("Error: one destination option is required", file=sys.stderr)
+                return 1
                 
             print(json.dumps(reply.to_dict(), indent=2))
         except asyncio.TimeoutError:
@@ -72,7 +97,8 @@ def main() -> int:
     send_parser = subparsers.add_parser("send", help="Send a fire-and-forget message")
     send_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     group = send_parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--to", help="Agent ID to send to")
+    group.add_argument("--to-account", help="Account ID to send to")
+    group.add_argument("--to-username", help="Username to send to")
     group.add_argument("--to-capability", help="Capability to send to")
     send_parser.add_argument("payload", help="JSON payload string")
 
@@ -81,7 +107,8 @@ def main() -> int:
     req_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     req_parser.add_argument("--timeout", type=float, default=5.0)
     group2 = req_parser.add_mutually_exclusive_group(required=True)
-    group2.add_argument("--to", help="Agent ID to request")
+    group2.add_argument("--to-account", help="Account ID to request")
+    group2.add_argument("--to-username", help="Username to request")
     group2.add_argument("--to-capability", help="Capability to request")
     req_parser.add_argument("payload", help="JSON payload string")
 
@@ -91,9 +118,26 @@ def main() -> int:
         if args.command == "list":
             return asyncio.run(_run_list(nats_url=args.nats_url, timeout=args.timeout))
         elif args.command == "send":
-            return asyncio.run(_run_send(args.nats_url, args.to, args.to_capability, args.payload))
+            return asyncio.run(
+                _run_send(
+                    args.nats_url,
+                    args.to_account,
+                    args.to_username,
+                    args.to_capability,
+                    args.payload,
+                )
+            )
         elif args.command == "request":
-            return asyncio.run(_run_request(args.nats_url, args.to, args.to_capability, args.payload, args.timeout))
+            return asyncio.run(
+                _run_request(
+                    args.nats_url,
+                    args.to_account,
+                    args.to_username,
+                    args.to_capability,
+                    args.payload,
+                    args.timeout,
+                )
+            )
     except KeyboardInterrupt:
         return 130
     except RuntimeError as exc:

@@ -13,14 +13,19 @@ from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 
 from agentnet.config import DEFAULT_NATS_URL
-from agentnet.registry import list_online_agents, list_online_agents_with_client
+from agentnet.registry import (
+    list_online_agents,
+    list_online_agents_with_client,
+    resolve_account_by_username,
+    resolve_account_by_username_with_client,
+)
 from agentnet.schema import AgentInfo, AgentMessage
 from agentnet.subjects import (
     REGISTRY_GOODBYE_SUBJECT,
     REGISTRY_HELLO_SUBJECT,
     REGISTRY_REGISTER_SUBJECT,
+    account_inbox_subject,
     agent_capability_subject,
-    agent_inbox_subject,
 )
 from agentnet.utils import decode_json, encode_json, new_id, utc_now_iso
 
@@ -32,6 +37,8 @@ class AgentNode:
         self,
         agent_id: str,
         name: str,
+        account_id: str | None = None,
+        username: str | None = None,
         capabilities: list[str] | None = None,
         nats_url: str = DEFAULT_NATS_URL,
         metadata: dict[str, Any] | None = None,
@@ -51,6 +58,8 @@ class AgentNode:
     ) -> None:
         self.agent_id = agent_id
         self.name = name
+        self.account_id = account_id
+        self.username = username
         self.capabilities = capabilities or []
         self.metadata = metadata or {}
         self.nats_url = nats_url
@@ -100,6 +109,8 @@ class AgentNode:
         return AgentInfo(
             agent_id=self.agent_id,
             name=self.name,
+            account_id=self.account_id,
+            username=self.username,
             session_tag=self.session_tag,
             capabilities=self.capabilities,
             metadata=self.metadata,
@@ -114,6 +125,8 @@ class AgentNode:
         pending_count = self._incoming_queue.qsize() if self._incoming_queue is not None else 0
         avg_ms = (self._handle_time_total_ms / self._processed_count) if self._processed_count else 0.0
         return {
+            "account_id": self.account_id,
+            "username": self.username,
             "agent_id": self.agent_id,
             "session_tag": self.session_tag,
             "inflight_count": self._inflight_count,
@@ -142,7 +155,13 @@ class AgentNode:
             if self._message_handler is not None:
                 self._start_workers()
                 self._accepting_messages = True
-                await self._nc.subscribe(agent_inbox_subject(self.agent_id), cb=self._handle_inbox)
+                if not self.account_id:
+                    raise RuntimeError("Account identity missing after register.")
+                await self._nc.subscribe(
+                    account_inbox_subject(self.account_id),
+                    queue=f"agentnet-account-{self.account_id}",
+                    cb=self._handle_inbox,
+                )
                 for capability in self.capabilities:
                     await self._nc.subscribe(
                         agent_capability_subject(capability),
@@ -208,16 +227,69 @@ class AgentNode:
         ttl_ms: int | None = None,
         trace_id: str | None = None,
     ) -> str:
+        explicit_account_id = self._parse_account_target(to)
+        if explicit_account_id:
+            return await self.send_to_account(
+                explicit_account_id,
+                payload=payload,
+                kind=kind,
+                ttl_ms=ttl_ms,
+                trace_id=trace_id,
+            )
+        explicit_username = self._parse_username_target(to)
+        if explicit_username:
+            return await self.send_to_username(
+                explicit_username,
+                payload=payload,
+                kind=kind,
+                ttl_ms=ttl_ms,
+                trace_id=trace_id,
+            )
+        raise ValueError(
+            "Routing target must be account:<account_id>, acct_..., username:<name>, or @name. "
+            "Use send_to_capability() for capability routing."
+        )
+
+    async def send_to_account(
+        self,
+        to_account_id: str,
+        payload: Any,
+        kind: str = "direct",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> str:
+        account_id = to_account_id.strip()
+        if not account_id:
+            raise ValueError("to_account_id is required")
         nc = self._require_connected_client()
         envelope = self._build_outbound_message(
-            to=to,
+            to=account_id,
+            payload=payload,
+            kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
+            to_account_id=account_id,
+        )
+        await nc.publish(account_inbox_subject(account_id), self._encode_message(envelope))
+        return envelope.message_id
+
+    async def send_to_username(
+        self,
+        username: str,
+        payload: Any,
+        kind: str = "direct",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+        timeout: float = 2.0,
+    ) -> str:
+        account_id = await self.resolve_account_id_by_username(username, timeout=timeout)
+        return await self.send_to_account(
+            to_account_id=account_id,
             payload=payload,
             kind=kind,
             ttl_ms=ttl_ms,
             trace_id=trace_id,
         )
-        await nc.publish(agent_inbox_subject(to), self._encode_message(envelope))
-        return envelope.message_id
 
     async def send_to_capability(
         self,
@@ -247,19 +319,119 @@ class AgentNode:
         ttl_ms: int | None = None,
         trace_id: str | None = None,
     ) -> AgentMessage:
+        explicit_account_id = self._parse_account_target(to)
+        if explicit_account_id:
+            return await self.request_account(
+                explicit_account_id,
+                payload=payload,
+                timeout=timeout,
+                kind=kind,
+                ttl_ms=ttl_ms,
+                trace_id=trace_id,
+            )
+        explicit_username = self._parse_username_target(to)
+        if explicit_username:
+            return await self.request_username(
+                explicit_username,
+                payload=payload,
+                timeout=timeout,
+                kind=kind,
+                ttl_ms=ttl_ms,
+                trace_id=trace_id,
+            )
+        raise ValueError(
+            "Routing target must be account:<account_id>, acct_..., username:<name>, or @name. "
+            "Use request_capability() for capability routing."
+        )
+
+    async def request_account(
+        self,
+        to_account_id: str,
+        payload: Any,
+        timeout: float = 5.0,
+        kind: str = "request",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> AgentMessage:
+        account_id = to_account_id.strip()
+        if not account_id:
+            raise ValueError("to_account_id is required")
         nc = self._require_connected_client()
         envelope = self._build_outbound_message(
-            to=to,
+            to=account_id,
             payload=payload,
             kind=kind,
             ttl_ms=ttl_ms,
             trace_id=trace_id,
+            to_account_id=account_id,
         )
-        reply_msg = await nc.request(agent_inbox_subject(to), self._encode_message(envelope), timeout=timeout)
+        reply_msg = await nc.request(account_inbox_subject(account_id), self._encode_message(envelope), timeout=timeout)
         data = decode_json(reply_msg.data)
         if not isinstance(data, dict):
             raise ValueError("reply message payload must be a JSON object")
         return AgentMessage.from_dict(data)
+
+    async def request_username(
+        self,
+        username: str,
+        payload: Any,
+        timeout: float = 5.0,
+        kind: str = "request",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+        lookup_timeout: float = 2.0,
+    ) -> AgentMessage:
+        account_id = await self.resolve_account_id_by_username(username, timeout=lookup_timeout)
+        return await self.request_account(
+            to_account_id=account_id,
+            payload=payload,
+            timeout=timeout,
+            kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
+        )
+
+    async def reply(
+        self,
+        request: AgentMessage,
+        payload: Any,
+        kind: str = "reply",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+    ) -> str:
+        if not request.reply_to:
+            raise ValueError("Cannot reply: incoming message has no reply_to subject.")
+        nc = self._require_connected_client()
+        to_account_id = request.from_account_id
+        to_target = to_account_id or request.from_agent or "unknown"
+        envelope = self._build_outbound_message(
+            to=to_target,
+            payload=payload,
+            kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id or request.trace_id or request.message_id,
+            to_account_id=to_account_id,
+        )
+        await nc.publish(request.reply_to, self._encode_message(envelope))
+        return envelope.message_id
+
+    async def resolve_account_id_by_username(self, username: str, timeout: float = 2.0) -> str:
+        target = username.strip().lower().lstrip("@")
+        if not target:
+            raise ValueError("username is required")
+        # Prefer dedicated resolve RPC; fall back to list scan for compatibility with older registries.
+        try:
+            if self._nc and self._nc.is_connected:
+                account_id, _ = await resolve_account_by_username_with_client(self._nc, target, timeout=timeout)
+            else:
+                account_id, _ = await resolve_account_by_username(self.nats_url, target, timeout=timeout)
+            return account_id
+        except Exception:  # noqa: BLE001
+            agents = await self.list_online_agents(timeout=timeout)
+            for agent in agents:
+                if agent.account_id and agent.username and agent.username.lower() == target:
+                    return agent.account_id
+        raise RuntimeError(f"No account found for username '{target}'")
 
     async def request_capability(
         self,
@@ -333,7 +505,7 @@ class AgentNode:
             await self._maybe_reply_error(message, ttl_error, "message ttl invalid or expired")
             return
 
-        sender_key = message.from_session_tag or message.from_agent or "unknown"
+        sender_key = message.from_session_tag or message.from_account_id or message.from_agent or "unknown"
         if not self._allow_sender(sender_key, now):
             self._rate_limited_count += 1
             self._dropped_count += 1
@@ -494,6 +666,7 @@ class AgentNode:
         kind: str,
         ttl_ms: int | None,
         trace_id: str | None,
+        to_account_id: str | None = None,
     ) -> AgentMessage:
         message_id = new_id()
         sent_at = utc_now_iso()
@@ -510,6 +683,8 @@ class AgentNode:
             to_agent=to,
             payload=payload,
             sent_at=sent_at,
+            from_account_id=self._require_account_id(),
+            to_account_id=to_account_id,
             from_session_tag=self._require_session_tag(),
             ttl_ms=effective_ttl,
             expires_at=expires_at,
@@ -545,6 +720,8 @@ class AgentNode:
                 "trace_id": request.trace_id or request.message_id,
             },
             sent_at=sent_at,
+            from_account_id=self.account_id,
+            to_account_id=request.from_account_id,
             from_session_tag=self.session_tag,
             ttl_ms=self.default_ttl_ms,
             expires_at=self._build_expiry_from_sent(sent_at, self.default_ttl_ms),
@@ -619,7 +796,14 @@ class AgentNode:
         session_tag = str(payload.get("session_tag") or "")
         if not session_tag:
             raise RuntimeError("Registry register did not return a session_tag.")
+        account_id = str(payload.get("account_id") or "")
+        if not account_id:
+            raise RuntimeError("Registry register did not return an account_id.")
         self.session_tag = session_tag
+        username = str(payload.get("username") or "")
+        self.account_id = account_id
+        if username:
+            self.username = username
 
         heartbeat_interval = payload.get("heartbeat_interval")
         try:
@@ -637,6 +821,39 @@ class AgentNode:
         if not self._nc or not self._nc.is_connected:
             raise RuntimeError("AgentNode is not connected. Call start() first.")
         return self._nc
+
+    def _require_account_id(self) -> str:
+        if not self.account_id:
+            raise RuntimeError("Agent account is not registered. Call start() first.")
+        return self.account_id
+
+    @staticmethod
+    def _parse_account_target(value: str) -> str | None:
+        target = value.strip()
+        if not target:
+            return None
+        lowered = target.lower()
+        if lowered.startswith("account:"):
+            parsed = target.split(":", 1)[1].strip()
+            return parsed or None
+        if target.startswith("acct_"):
+            return target
+        return None
+
+    @staticmethod
+    def _parse_username_target(value: str) -> str | None:
+        target = value.strip()
+        if not target:
+            return None
+        lowered = target.lower()
+        if lowered.startswith("capability:"):
+            return None
+        if lowered.startswith("username:"):
+            parsed = target.split(":", 1)[1].strip().lstrip("@")
+            return parsed or None
+        if target.startswith("@"):
+            return target[1:].strip() or None
+        return target
 
     async def _heartbeat_loop(self) -> None:
         while True:

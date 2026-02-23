@@ -8,6 +8,7 @@ async def main() -> None:
     node = AgentNode(
         agent_id="agent_b",
         name="Agent B",
+        username="agent_b",
         capabilities=["receive", "notify"],
         nats_url=DEFAULT_NATS_URL,
     )
