@@ -1,4 +1,4 @@
-# AgentNet (NATS Agent Network)
+# AgentNet (NATS Agent Network).
 
 `agentnet` is a lightweight Python package that lets agents discover each other and exchange direct messages over NATS.
 
