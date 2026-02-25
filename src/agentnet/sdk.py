@@ -145,6 +145,11 @@ class AgentWrapper:
         kind: str = "direct",
         ttl_ms: int | None = None,
         trace_id: str | None = None,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
     ) -> str:
         self._validate_target(to_account_id=to_account_id, to_username=to_username, to_capability=to_capability)
         if to_account_id is not None:
@@ -154,6 +159,11 @@ class AgentWrapper:
                 kind=kind,
                 ttl_ms=ttl_ms,
                 trace_id=trace_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
+                require_delivery_ack=require_delivery_ack,
+                retry_attempts=retry_attempts,
+                receipt_timeout=receipt_timeout,
             )
         if to_username is not None:
             return await self._node.send_to_username(
@@ -162,6 +172,11 @@ class AgentWrapper:
                 kind=kind,
                 ttl_ms=ttl_ms,
                 trace_id=trace_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
+                require_delivery_ack=require_delivery_ack,
+                retry_attempts=retry_attempts,
+                receipt_timeout=receipt_timeout,
             )
         if to_capability is not None:
             return await self._node.send_to_capability(
@@ -170,6 +185,11 @@ class AgentWrapper:
                 kind=kind,
                 ttl_ms=ttl_ms,
                 trace_id=trace_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
+                require_delivery_ack=require_delivery_ack,
+                retry_attempts=retry_attempts,
+                receipt_timeout=receipt_timeout,
             )
         raise AssertionError("unreachable")
 
@@ -184,6 +204,8 @@ class AgentWrapper:
         kind: str = "request",
         ttl_ms: int | None = None,
         trace_id: str | None = None,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
     ) -> AgentMessage:
         self._validate_target(to_account_id=to_account_id, to_username=to_username, to_capability=to_capability)
         if to_account_id is not None:
@@ -194,6 +216,8 @@ class AgentWrapper:
                 kind=kind,
                 ttl_ms=ttl_ms,
                 trace_id=trace_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
             )
             self._raise_if_error_reply(reply)
             return reply
@@ -205,6 +229,8 @@ class AgentWrapper:
                 kind=kind,
                 ttl_ms=ttl_ms,
                 trace_id=trace_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
             )
             self._raise_if_error_reply(reply)
             return reply
@@ -216,6 +242,8 @@ class AgentWrapper:
                 kind=kind,
                 ttl_ms=ttl_ms,
                 trace_id=trace_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
             )
             self._raise_if_error_reply(reply)
             return reply
@@ -229,6 +257,8 @@ class AgentWrapper:
         kind: str = "reply",
         ttl_ms: int | None = None,
         trace_id: str | None = None,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
     ) -> str:
         return await self._node.reply(
             request=request,
@@ -236,7 +266,35 @@ class AgentWrapper:
             kind=kind,
             ttl_ms=ttl_ms,
             trace_id=trace_id,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
         )
+
+    async def search_profiles(
+        self,
+        *,
+        query: str = "",
+        capability: str | None = None,
+        limit: int = 20,
+        online_only: bool = False,
+        timeout: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        return await self._node.search_profiles(
+            query=query,
+            capability=capability,
+            limit=limit,
+            online_only=online_only,
+            timeout=timeout,
+        )
+
+    async def get_profile(
+        self,
+        *,
+        account_id: str | None = None,
+        username: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        return await self._node.get_profile(account_id=account_id, username=username, timeout=timeout)
 
     @staticmethod
     def _validate_target(

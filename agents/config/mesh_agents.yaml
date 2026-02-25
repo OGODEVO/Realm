@@ -1,0 +1,49 @@
+defaults:
+  nats_url_env: NATS_URL
+  max_history_messages: 40
+  request_timeout_seconds: 60
+  context_timezone: America/Chicago
+
+agents:
+  - key: agent_1
+    agent_id: mesh_agent_1
+    username: mesh_agent_1
+    name: Mesh Agent 1
+    system_prompt_path: prompts/agent_1.txt
+    allowed_tools:
+      - "*"
+    model_config:
+      provider: openai
+      model: gpt-5.2
+      api_key_env: OPENAI_API_KEY
+      base_url_env: OPENAI_BASE_URL
+      temperature: 0.2
+      max_tokens: 128000
+
+  - key: agent_2
+    agent_id: mesh_agent_2
+    username: mesh_agent_2
+    name: Mesh Agent 2
+    system_prompt_path: prompts/agent_2.txt
+    allowed_tools: []
+    model_config:
+      provider: openai
+      model: zai-org/glm-5
+      api_key_env: NOVITA_API_KEY
+      base_url_env: NOVITA_BASE_URL
+      temperature: 0.2
+      max_tokens: 131072
+
+  - key: agent_3
+    agent_id: mesh_agent_3
+    username: mesh_agent_3
+    name: Mesh Agent 3
+    system_prompt_path: prompts/agent_3.txt
+    allowed_tools: []
+    model_config:
+      provider: claude
+      model: claude-sonnet-4-6
+      api_key_env: ANTHROPIC_API_KEY
+      base_url_env: ANTHROPIC_BASE_URL
+      temperature: 0.2
+      max_tokens: 64000

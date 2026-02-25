@@ -7,10 +7,13 @@
 - Agents join the network with a single `AgentNode`
 - Account inbox routing (`account.<account_id>.inbox`) with stable account identity
 - Online registry with agent metadata and capabilities
+- Thread-aware messaging (`thread_id`, `parent_message_id`)
+- Discovery RPCs (`registry.search`, `registry.profile`)
+- Delivery receipts with sender retry policy
 - Async-first API for scripts and long-running workers
 - Bounded in-process concurrency (worker cap + pending queue cap)
 - Safety guardrails: TTL checks, dedupe, rate limiting, work timeouts, circuit breaker
-- Durable session metadata in Postgres (`agent_sessions`)
+- Durable metadata in Postgres (`agent_accounts`, `agent_sessions`, `agent_threads`, `agent_messages`)
 
 ## Quickstart
 
@@ -32,7 +35,7 @@ This starts:
 
 - NATS on `localhost:4222`
 - Postgres for durable session metadata
-- Registry service subscribed to `registry.register`, `registry.hello`, `registry.goodbye`, and `registry.list`
+- Registry service subscribed to `registry.register`, `registry.hello`, `registry.goodbye`, `registry.list`, `registry.search`, and `registry.profile`
 
 ### 3) Integrate into your agent (5-10 lines)
 
@@ -94,6 +97,8 @@ Account-route message examples:
 ```bash
 agentnet send --nats-url nats://agentnet_secret_token@localhost:4222 --to-username weather_bot '{"text":"yo"}'
 agentnet request --nats-url nats://agentnet_secret_token@localhost:4222 --to-account acct_01abc... '{"text":"ping"}'
+agentnet search --nats-url nats://agentnet_secret_token@localhost:4222 --query weather --online-only
+agentnet profile --nats-url nats://agentnet_secret_token@localhost:4222 --username weather_bot
 ```
 
 ## Security
@@ -101,6 +106,21 @@ agentnet request --nats-url nats://agentnet_secret_token@localhost:4222 --to-acc
 AgentNet relies on **NATS Token Authentication** to ensure that unauthorized third parties cannot connect to your backend router and spoof AI agents. 
 
 Your `docker-compose.yml` backend spins up requiring the default token `agentnet_secret_token`. You must prepend this token (like `nats://<TOKEN>@<IP>`) to every `AgentNode` or CLI command, or the server will instantly reject the TCP connection. Before deploying to production, ALWAYS change this `--auth` token in your docker network!
+
+## Dev Auth (local key signing)
+
+For local anti-spoof testing, you can enable dev auth:
+
+1. Start registry with `DEV_AUTH=true` (compose env is supported):
+
+```bash
+DEV_AUTH=true docker compose -f docker/docker-compose.yml up -d --build registry
+```
+2. Set `DEV_AUTH=true` in agent env.
+3. Each agent auto-creates a local key file in `.keys/<username-or-agent>.json`.
+4. Register requests are signed (`dev-ed25519-v1`), and registry binds one public key per account.
+
+If a different key later tries to register for the same account, registry rejects it with `auth_public_key_mismatch`.
 
 ## Durable identity + sessions
 
@@ -134,13 +154,23 @@ Registry persists account metadata into `agent_accounts` and session metadata in
 
 Retention is controlled by `SESSION_RETENTION_DAYS` (default: `14`). Offline sessions older than retention are pruned.
 
+Thread/message persistence:
+
+- `agent_threads` stores thread metadata and participant account IDs.
+- `agent_messages` stores message envelopes keyed by `message_id` with `thread_id` and `parent_message_id`.
+- Registry persists messages by tapping NATS subjects (`account.*.inbox`, `agent.capability.*`, `_INBOX.>`).
+
 ## Protocol (subjects + JSON schema)
 
 ### Subjects
 
 - Account messages: `account.<account_id>.inbox`
+- Delivery receipts: `account.<account_id>.receipts`
 - Register (request/reply): `registry.register`
 - Account resolve (request/reply): `registry.resolve_account`
+- Key resolve (request/reply): `registry.resolve_key`
+- Search (request/reply): `registry.search`
+- Profile (request/reply): `registry.profile`
 - Presence hello: `registry.hello`
 - Presence goodbye: `registry.goodbye`
 - List request: `registry.list` (request/reply)
@@ -160,7 +190,30 @@ Retention is controlled by `SESSION_RETENTION_DAYS` (default: `14`). Offline ses
   "ttl_ms": 30000,
   "expires_at": "2026-02-21T08:00:30Z",
   "trace_id": "b3d0...",
-  "kind": "direct"
+  "thread_id": "thread_b3d0...",
+  "parent_message_id": null,
+  "kind": "direct",
+  "auth": {
+    "scheme": "dev-ed25519-v1",
+    "public_key": "<base64url>",
+    "claims": {"message_id": "b3d0...", "payload_sha256": "..."},
+    "signature": "<base64url>"
+  }
+}
+```
+
+### Delivery receipt JSON
+
+```json
+{
+  "message_id": "b3d0...",
+  "status": "accepted",
+  "event_at": "2026-02-21T08:00:00Z",
+  "from_account_id": "acct_02...",
+  "from_session_tag": "registry_01J...",
+  "to_account_id": "acct_01...",
+  "trace_id": "b3d0...",
+  "thread_id": "thread_b3d0..."
 }
 ```
 
@@ -194,6 +247,8 @@ Retention is controlled by `SESSION_RETENTION_DAYS` (default: `14`). Offline ses
 `agent_id` is the logical role label. `account_id` is stable routing identity. `session_tag` is the unique identity for that specific running process instance.
 
 `send()` / `request()` are account-routed only. Use account targets (`to="account:acct_..."`, `to="acct_..."`) or usernames (`to="@name"` or `to="name"`). You can also call `send_to_account()`, `request_account()`, `send_to_username()`, and `request_username()` directly.
+
+`send_*()` waits for a delivery receipt by default and retries publish on receipt timeout (`default_send_retry_attempts=2`, `default_receipt_timeout_seconds=1.5`).
 
 Incoming messages without `ttl_ms` or `expires_at` are rejected by default.
 
@@ -308,3 +363,41 @@ For cleaner recording output, tune these in `agents/.env`:
 - `NOVITA_MAX_TOKENS=256` for shorter answers
 - `LOG_TEXT_MAX_CHARS=700` to cap displayed text length per log block
 - `TARGET_USERNAME=agent_novita_b` to control who Agent A talks to
+
+## Agent Skeleton (YAML + prompts + tools)
+
+This repo now includes a 3-agent skeleton that uses:
+
+- per-agent system prompt files in `agents/prompts/`
+- per-agent tool allowlists from `tools/`
+- per-agent provider/model config from YAML
+- OpenAI-compatible `/v1/chat/completions` and Claude `/v1/messages`
+
+Files:
+
+- `agents/agent_mesh_trio.py` (runner)
+- `agents/config/mesh_agents.yaml` (agent/model/tool config)
+- `agents/prompts/agent_1.txt`, `agents/prompts/agent_2.txt`, `agents/prompts/agent_3.txt`
+
+Run:
+
+```bash
+cd /Users/klyexy/Documents/realm
+source venv/bin/activate
+set -a
+source agents/.env
+set +a
+python agents/agent_mesh_trio.py --config agents/config/mesh_agents.yaml
+```
+
+Run a subset:
+
+```bash
+python agents/agent_mesh_trio.py --config agents/config/mesh_agents.yaml --only agent_1 --only agent_2
+```
+
+Required env vars for this skeleton:
+
+- `OPENAI_API_KEY`, `OPENAI_BASE_URL`
+- `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`
+- tool-side keys (if you call those tools): `RSC_TOKEN`, `ODDS_API_KEY`, `PERPLEXITY_API_KEY`

@@ -5,10 +5,17 @@ REGISTRY_HELLO_SUBJECT = "registry.hello"
 REGISTRY_GOODBYE_SUBJECT = "registry.goodbye"
 REGISTRY_LIST_SUBJECT = "registry.list"
 REGISTRY_RESOLVE_ACCOUNT_SUBJECT = "registry.resolve_account"
+REGISTRY_RESOLVE_KEY_SUBJECT = "registry.resolve_key"
+REGISTRY_SEARCH_SUBJECT = "registry.search"
+REGISTRY_PROFILE_SUBJECT = "registry.profile"
 
 
 def account_inbox_subject(account_id: str) -> str:
     return f"account.{account_id}.inbox"
+
+
+def account_receipts_subject(account_id: str) -> str:
+    return f"account.{account_id}.receipts"
 
 
 def agent_capability_subject(capability: str) -> str:

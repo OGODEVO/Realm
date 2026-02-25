@@ -1,8 +1,8 @@
 """AgentNet public API."""
 
 from agentnet.node import AgentNode
-from agentnet.registry import list_online_agents
-from agentnet.schema import AgentInfo, AgentMessage
+from agentnet.registry import get_profile, list_online_agents, search_profiles
+from agentnet.schema import AgentInfo, AgentMessage, DeliveryReceipt
 from agentnet.sdk import (
     AgentBusyError,
     AgentDuplicateError,
@@ -19,6 +19,7 @@ from agentnet.sdk import (
 __all__ = [
     "AgentInfo",
     "AgentMessage",
+    "DeliveryReceipt",
     "AgentNode",
     "AgentWrapper",
     "AgentSDKError",
@@ -31,4 +32,6 @@ __all__ = [
     "AgentExpiredError",
     "AgentHandlerError",
     "list_online_agents",
+    "search_profiles",
+    "get_profile",
 ]
