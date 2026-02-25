@@ -9,6 +9,7 @@
 - Online registry with agent metadata and capabilities
 - Thread-aware messaging (`thread_id`, `parent_message_id`)
 - Discovery RPCs (`registry.search`, `registry.profile`)
+- Thread budget status RPC (`registry.thread_status`) for compaction signaling
 - Delivery receipts with sender retry policy
 - Async-first API for scripts and long-running workers
 - Bounded in-process concurrency (worker cap + pending queue cap)
@@ -69,6 +70,43 @@ await node.send_to_account(to_account_id="acct_01...", payload={"text": "yo"})
 await node.send_to_username(username="weather_bot", payload={"text": "yo"})
 ```
 
+## SDK v2 (agent-friendly)
+
+Use the high-level SDK for common agent workflows:
+
+```python
+from agentnet.sdk import AgentSDK
+
+async with AgentSDK(
+    agent_id="agent_a",
+    name="Agent A",
+    nats_url="nats://agentnet_secret_token@localhost:4222",
+) as sdk:
+    online = await sdk.list_online()
+    print([a.username for a in online])
+
+    profile = await sdk.get_profile("mesh_agent_1")
+    print(profile.get("bio", ""))
+
+    result = await sdk.ask_text(
+        "mesh_agent_1",
+        "Analyze spread and total for Celtics @ Suns",
+        thread_id="ops_1",
+    )
+    print(result.text)
+
+    thread = sdk.thread("ops_1")
+    await thread.send_text("mesh_agent_1", "Confirm your final pick")
+```
+
+LLM local tool wrappers can directly call:
+
+- `sdk.list_online()`
+- `sdk.get_profile(target)`
+- `sdk.ask_text(to, text, thread_id=...)`
+- `sdk.send_text(to, text, thread_id=...)`
+- `sdk.thread_status(thread_id)`
+
 Under the hood this publishes to:
 
 - `account.acct_01....inbox`
@@ -100,6 +138,34 @@ agentnet request --nats-url nats://agentnet_secret_token@localhost:4222 --to-acc
 agentnet search --nats-url nats://agentnet_secret_token@localhost:4222 --query weather --online-only
 agentnet profile --nats-url nats://agentnet_secret_token@localhost:4222 --username weather_bot
 ```
+
+Operator workflows (easy testing + visibility):
+
+```bash
+# Watch live inbox traffic (summary lines)
+agentnet watch --nats-url nats://agentnet_secret_token@localhost:4222 --subject 'account.*.inbox'
+
+# Watch delivery receipts
+agentnet watch --nats-url nats://agentnet_secret_token@localhost:4222 --subject 'account.*.receipts'
+
+# Join as an operator and chat interactively with an agent
+agentnet chat --nats-url nats://agentnet_secret_token@localhost:4222 --to-username mesh_agent_1 --thread-id ops_thread_1
+
+# Inspect a thread's token budget status (ok / warn / needs_compaction)
+agentnet thread-status --nats-url nats://agentnet_secret_token@localhost:4222 --thread-id ops_thread_1
+```
+
+`agentnet chat` commands:
+
+- `/showthread` prints current thread id
+- `/thread <id>` switches thread context
+- `/quit` exits interactive mode
+
+`agentnet thread-status` outputs:
+
+- `message_count`, `byte_count`, `approx_tokens`, `latest_checkpoint_end`
+- status classification: `ok`, `warn`, `needs_compaction`
+- thresholds from registry defaults or CLI overrides
 
 ## Security
 
@@ -171,6 +237,7 @@ Thread/message persistence:
 - Key resolve (request/reply): `registry.resolve_key`
 - Search (request/reply): `registry.search`
 - Profile (request/reply): `registry.profile`
+- Thread status (request/reply): `registry.thread_status`
 - Presence hello: `registry.hello`
 - Presence goodbye: `registry.goodbye`
 - List request: `registry.list` (request/reply)
@@ -251,6 +318,12 @@ Thread/message persistence:
 `send_*()` waits for a delivery receipt by default and retries publish on receipt timeout (`default_send_retry_attempts=2`, `default_receipt_timeout_seconds=1.5`).
 
 Incoming messages without `ttl_ms` or `expires_at` are rejected by default.
+
+Thread budget env knobs (registry service):
+
+- `THREAD_SOFT_LIMIT_TOKENS` (default `50000`)
+- `THREAD_HARD_LIMIT_TOKENS` (default `60000`)
+- `TOKEN_ESTIMATE_CHARS_PER_TOKEN` (default `4`)
 
 ## Heartbeat requirement (must-have)
 

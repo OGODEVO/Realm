@@ -15,6 +15,7 @@ from agentnet.subjects import (
     REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
     REGISTRY_RESOLVE_KEY_SUBJECT,
     REGISTRY_SEARCH_SUBJECT,
+    REGISTRY_THREAD_STATUS_SUBJECT,
 )
 from agentnet.utils import decode_json, encode_json
 
@@ -268,3 +269,64 @@ async def get_profile_with_client(
     if not isinstance(profile, dict):
         raise RuntimeError("registry.profile missing profile")
     return profile
+
+
+async def get_thread_status(
+    nats_url: str,
+    *,
+    thread_id: str,
+    soft_limit_tokens: int | None = None,
+    hard_limit_tokens: int | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await get_thread_status_with_client(
+            nc,
+            thread_id=thread_id,
+            soft_limit_tokens=soft_limit_tokens,
+            hard_limit_tokens=hard_limit_tokens,
+            timeout=timeout,
+        )
+    finally:
+        await nc.drain()
+
+
+async def get_thread_status_with_client(
+    nc: NATS,
+    *,
+    thread_id: str,
+    soft_limit_tokens: int | None = None,
+    hard_limit_tokens: int | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    normalized_thread_id = str(thread_id or "").strip()
+    if not normalized_thread_id:
+        raise ValueError("thread_id is required")
+
+    payload: dict[str, Any] = {"thread_id": normalized_thread_id}
+    if soft_limit_tokens is not None:
+        payload["soft_limit_tokens"] = max(1, int(soft_limit_tokens))
+    if hard_limit_tokens is not None:
+        payload["hard_limit_tokens"] = max(1, int(hard_limit_tokens))
+
+    try:
+        response = await nc.request(REGISTRY_THREAD_STATUS_SUBJECT, encode_json(payload), timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.thread_status") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.thread_status response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "thread_status_failed"))
+    return data

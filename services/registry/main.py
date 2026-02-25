@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -27,6 +28,7 @@ from agentnet.subjects import (
     REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
     REGISTRY_RESOLVE_KEY_SUBJECT,
     REGISTRY_SEARCH_SUBJECT,
+    REGISTRY_THREAD_STATUS_SUBJECT,
 )
 from agentnet.utils import decode_json, encode_json, new_ulid, utc_now_iso
 
@@ -57,10 +59,50 @@ def normalize_username(raw: str) -> str:
     return normalized
 
 
+def _coerce_non_negative_int(value: Any, default: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, parsed)
+
+
+def _estimate_tokens(byte_count: int, chars_per_token: float) -> int:
+    if byte_count <= 0:
+        return 0
+    return int(math.ceil(float(byte_count) / max(1.0, float(chars_per_token))))
+
+
+def _extract_checkpoint_end(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    payload_type = str(payload.get("type") or "").strip().lower()
+    if payload_type != "checkpoint":
+        return 0
+    return _coerce_non_negative_int(payload.get("covers_end"), default=0)
+
+
+def _classify_thread_status(approx_tokens: int, soft_limit_tokens: int, hard_limit_tokens: int) -> str:
+    soft = max(1, soft_limit_tokens)
+    hard = max(soft, hard_limit_tokens)
+    if approx_tokens >= hard:
+        return "needs_compaction"
+    if approx_tokens >= soft:
+        return "warn"
+    return "ok"
+
+
 class PostgresSessionStore:
-    def __init__(self, database_url: str, retention_days: float = 14.0, logger: logging.Logger | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        retention_days: float = 14.0,
+        token_estimate_chars_per_token: float = 4.0,
+        logger: logging.Logger | None = None,
+    ) -> None:
         self.database_url = database_url
         self.retention_days = max(1.0, retention_days)
+        self.token_estimate_chars_per_token = max(1.0, token_estimate_chars_per_token)
         self.logger = logger or logging.getLogger("agentnet.registry.db")
         self._pool: Any | None = None
 
@@ -132,6 +174,11 @@ class PostgresSessionStore:
             )
             """
         )
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS message_count BIGINT NOT NULL DEFAULT 0")
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS byte_count BIGINT NOT NULL DEFAULT 0")
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS approx_tokens BIGINT NOT NULL DEFAULT 0")
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS latest_checkpoint_end BIGINT NOT NULL DEFAULT 0")
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ NULL")
         await self._pool.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_messages (
@@ -409,6 +456,44 @@ class PostgresSessionStore:
             "online": bool(online_sessions),
         }
 
+    async def get_thread_status(self, thread_id: str) -> dict[str, Any] | None:
+        if self._pool is None:
+            raise RuntimeError("Postgres session store is not started")
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            return None
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                thread_id,
+                participants,
+                created_at,
+                updated_at,
+                message_count,
+                byte_count,
+                approx_tokens,
+                latest_checkpoint_end,
+                last_message_at
+            FROM agent_threads
+            WHERE thread_id = $1
+            """,
+            normalized_thread_id,
+        )
+        if not row:
+            return None
+        participants = row["participants"] if isinstance(row["participants"], list) else []
+        return {
+            "thread_id": str(row["thread_id"]),
+            "participants": [str(item) for item in participants],
+            "created_at": _iso_utc(row["created_at"]),
+            "updated_at": _iso_utc(row["updated_at"]),
+            "message_count": _coerce_non_negative_int(row["message_count"]),
+            "byte_count": _coerce_non_negative_int(row["byte_count"]),
+            "approx_tokens": _coerce_non_negative_int(row["approx_tokens"]),
+            "latest_checkpoint_end": _coerce_non_negative_int(row["latest_checkpoint_end"]),
+            "last_message_at": _iso_utc(row["last_message_at"]) if row["last_message_at"] is not None else None,
+        }
+
     async def persist_message(self, message: AgentMessage, received_at: datetime) -> None:
         if self._pool is None:
             return
@@ -424,6 +509,9 @@ class PostgresSessionStore:
             payload_json = json.dumps(payload_value)
         except TypeError:
             payload_json = json.dumps({"text": str(payload_value)})
+        payload_bytes = len(payload_json.encode("utf-8"))
+        payload_tokens = _estimate_tokens(payload_bytes, self.token_estimate_chars_per_token)
+        checkpoint_end = _extract_checkpoint_end(payload_value)
         metadata_payload = {
             "ttl_ms": message.ttl_ms,
             "expires_at": message.expires_at,
@@ -452,26 +540,14 @@ class PostgresSessionStore:
                 json.dumps({}),
                 received_at,
             )
-            await conn.execute(
+            insert_result = await conn.execute(
                 """
                 INSERT INTO agent_messages (
                     message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id, to_agent,
                     kind, payload, trace_id, sent_at, received_at, status, metadata
                 )
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, 'received', $13::jsonb)
-                ON CONFLICT (message_id) DO UPDATE
-                SET
-                    thread_id = EXCLUDED.thread_id,
-                    parent_message_id = EXCLUDED.parent_message_id,
-                    to_account_id = EXCLUDED.to_account_id,
-                    to_agent = EXCLUDED.to_agent,
-                    kind = EXCLUDED.kind,
-                    payload = EXCLUDED.payload,
-                    trace_id = EXCLUDED.trace_id,
-                    sent_at = EXCLUDED.sent_at,
-                    received_at = EXCLUDED.received_at,
-                    status = EXCLUDED.status,
-                    metadata = EXCLUDED.metadata
+                ON CONFLICT (message_id) DO NOTHING
                 """,
                 message_id,
                 thread_id,
@@ -487,6 +563,26 @@ class PostgresSessionStore:
                 received_at,
                 json.dumps(metadata_payload),
             )
+            inserted = insert_result.endswith("1")
+            if inserted:
+                await conn.execute(
+                    """
+                    UPDATE agent_threads
+                    SET
+                        message_count = COALESCE(message_count, 0) + 1,
+                        byte_count = COALESCE(byte_count, 0) + $2,
+                        approx_tokens = COALESCE(approx_tokens, 0) + $3,
+                        latest_checkpoint_end = GREATEST(COALESCE(latest_checkpoint_end, 0), $4),
+                        last_message_at = GREATEST(COALESCE(last_message_at, $5), $5),
+                        updated_at = GREATEST(updated_at, $5)
+                    WHERE thread_id = $1
+                    """,
+                    thread_id,
+                    payload_bytes,
+                    payload_tokens,
+                    checkpoint_end,
+                    sent_at,
+                )
 
     async def _next_available_username(self, conn: Any, base: str) -> str:
         taken = await conn.fetchval("SELECT account_id FROM agent_accounts WHERE username = $1", base)
@@ -611,6 +707,9 @@ class RegistryService:
         ttl_seconds: float = 40.0,
         gc_interval_seconds: float = 5.0,
         heartbeat_interval_seconds: float = 12.0,
+        thread_soft_limit_tokens: int = 50000,
+        thread_hard_limit_tokens: int = 60000,
+        token_estimate_chars_per_token: float = 4.0,
         server_id: str = "registry",
         database_url: str | None = None,
         session_retention_days: float = 14.0,
@@ -622,6 +721,9 @@ class RegistryService:
         self.ttl_seconds = ttl_seconds
         self.gc_interval_seconds = gc_interval_seconds
         self.heartbeat_interval_seconds = max(1.0, heartbeat_interval_seconds)
+        self.thread_soft_limit_tokens = max(1, int(thread_soft_limit_tokens))
+        self.thread_hard_limit_tokens = max(self.thread_soft_limit_tokens, int(thread_hard_limit_tokens))
+        self.token_estimate_chars_per_token = max(1.0, float(token_estimate_chars_per_token))
         self.server_id = server_id
         self.logger = logging.getLogger(f"agentnet.registry.{server_id}")
         self.dev_auth_enabled = bool(dev_auth_enabled)
@@ -639,7 +741,12 @@ class RegistryService:
         self._local_messages: dict[str, dict[str, Any]] = {}
         self._seen_register_nonces: dict[str, float] = {}
         self._store = (
-            PostgresSessionStore(database_url, retention_days=session_retention_days, logger=self.logger)
+            PostgresSessionStore(
+                database_url,
+                retention_days=session_retention_days,
+                token_estimate_chars_per_token=self.token_estimate_chars_per_token,
+                logger=self.logger,
+            )
             if database_url
             else None
         )
@@ -659,6 +766,7 @@ class RegistryService:
         await self._nc.subscribe(REGISTRY_RESOLVE_KEY_SUBJECT, cb=self._on_resolve_key)
         await self._nc.subscribe(REGISTRY_SEARCH_SUBJECT, cb=self._on_search)
         await self._nc.subscribe(REGISTRY_PROFILE_SUBJECT, cb=self._on_profile)
+        await self._nc.subscribe(REGISTRY_THREAD_STATUS_SUBJECT, cb=self._on_thread_status)
         await self._nc.subscribe("account.*.inbox", cb=self._on_account_message)
         await self._nc.subscribe("agent.capability.*", cb=self._on_account_message)
         await self._nc.subscribe("_INBOX.>", cb=self._on_account_message)
@@ -667,6 +775,7 @@ class RegistryService:
         print(
             f"registry ready: nats={self.nats_url} server_id={self.server_id} "
             f"ttl={self.ttl_seconds}s heartbeat={self.heartbeat_interval_seconds}s "
+            f"thread_soft={self.thread_soft_limit_tokens} thread_hard={self.thread_hard_limit_tokens} "
             f"db={'enabled' if self._store else 'disabled'} "
             f"dev_auth={'enabled' if self.dev_auth_enabled else 'disabled'}"
         )
@@ -953,6 +1062,51 @@ class RegistryService:
             return
         await self._nc.publish(msg.reply, encode_json({"profile": profile, "generated_at": utc_now_iso()}))
 
+    async def _on_thread_status(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        data = decode_json(msg.data)
+        if not isinstance(data, dict):
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_status payload must be an object"}))
+            return
+        thread_id = str(data.get("thread_id") or "").strip()
+        if not thread_id:
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_id is required"}))
+            return
+
+        soft_limit_tokens = _coerce_non_negative_int(
+            data.get("soft_limit_tokens"),
+            default=self.thread_soft_limit_tokens,
+        )
+        hard_limit_tokens = _coerce_non_negative_int(
+            data.get("hard_limit_tokens"),
+            default=self.thread_hard_limit_tokens,
+        )
+        soft_limit_tokens = max(1, soft_limit_tokens)
+        hard_limit_tokens = max(soft_limit_tokens, hard_limit_tokens)
+
+        try:
+            thread = await self._get_thread_status(thread_id)
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed thread status lookup thread_id=%s", thread_id)
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_status_failed"}))
+            return
+        if thread is None:
+            await self._nc.publish(msg.reply, encode_json({"error": "not_found"}))
+            return
+
+        approx_tokens = _coerce_non_negative_int(thread.get("approx_tokens"))
+        status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
+        response = {
+            **thread,
+            "status": status,
+            "soft_limit_tokens": soft_limit_tokens,
+            "hard_limit_tokens": hard_limit_tokens,
+            "token_estimate_chars_per_token": self.token_estimate_chars_per_token,
+            "generated_at": utc_now_iso(),
+        }
+        await self._nc.publish(msg.reply, encode_json(response))
+
     async def _on_account_message(self, msg: Msg) -> None:
         try:
             data = decode_json(msg.data)
@@ -1204,8 +1358,30 @@ class RegistryService:
             "online": bool(sessions),
         }
 
+    async def _get_thread_status(self, thread_id: str) -> dict[str, Any] | None:
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            return None
+        if self._store is not None:
+            return await self._store.get_thread_status(normalized_thread_id)
+        thread = self._local_threads.get(normalized_thread_id)
+        if thread is None:
+            return None
+        return {
+            "thread_id": normalized_thread_id,
+            "participants": thread.get("participants") if isinstance(thread.get("participants"), list) else [],
+            "created_at": str(thread.get("created_at") or ""),
+            "updated_at": str(thread.get("updated_at") or ""),
+            "message_count": _coerce_non_negative_int(thread.get("message_count")),
+            "byte_count": _coerce_non_negative_int(thread.get("byte_count")),
+            "approx_tokens": _coerce_non_negative_int(thread.get("approx_tokens")),
+            "latest_checkpoint_end": _coerce_non_negative_int(thread.get("latest_checkpoint_end")),
+            "last_message_at": str(thread.get("last_message_at") or "") or None,
+        }
+
     def _persist_message_local(self, message: AgentMessage) -> None:
         thread_id = str(message.thread_id or "").strip() or f"thread_{(message.trace_id or message.message_id).lower()}"
+        is_new_message = message.message_id not in self._local_messages
         existing_thread = self._local_threads.get(thread_id)
         participants = set()
         if existing_thread is not None:
@@ -1217,17 +1393,43 @@ class RegistryService:
             if participant_value:
                 participants.add(participant_value)
 
+        payload_value = message.payload
+        try:
+            payload_json = json.dumps(payload_value)
+        except TypeError:
+            payload_json = json.dumps({"text": str(payload_value)})
+        payload_bytes = len(payload_json.encode("utf-8"))
+        payload_tokens = _estimate_tokens(payload_bytes, self.token_estimate_chars_per_token)
+        checkpoint_end = _extract_checkpoint_end(payload_value)
+        sent_at = str(message.sent_at or "").strip() or utc_now_iso()
         now_iso = utc_now_iso()
         if existing_thread is None:
-            self._local_threads[thread_id] = {
+            existing_thread = {
                 "thread_id": thread_id,
                 "created_by_account_id": message.from_account_id,
                 "participants": sorted(participants),
+                "message_count": 0,
+                "byte_count": 0,
+                "approx_tokens": 0,
+                "latest_checkpoint_end": 0,
+                "last_message_at": None,
                 "created_at": now_iso,
                 "updated_at": now_iso,
             }
+            self._local_threads[thread_id] = existing_thread
         else:
             existing_thread["participants"] = sorted(participants)
+            existing_thread["updated_at"] = now_iso
+
+        if is_new_message:
+            existing_thread["message_count"] = _coerce_non_negative_int(existing_thread.get("message_count")) + 1
+            existing_thread["byte_count"] = _coerce_non_negative_int(existing_thread.get("byte_count")) + payload_bytes
+            existing_thread["approx_tokens"] = _coerce_non_negative_int(existing_thread.get("approx_tokens")) + payload_tokens
+            existing_thread["latest_checkpoint_end"] = max(
+                _coerce_non_negative_int(existing_thread.get("latest_checkpoint_end")),
+                checkpoint_end,
+            )
+            existing_thread["last_message_at"] = sent_at
             existing_thread["updated_at"] = now_iso
 
         self._local_messages[message.message_id] = {
@@ -1243,6 +1445,8 @@ class RegistryService:
             "kind": message.kind,
             "sent_at": message.sent_at,
             "received_at": now_iso,
+            "byte_count": payload_bytes,
+            "approx_tokens": payload_tokens,
         }
 
     async def _validate_register_auth(
@@ -1374,6 +1578,9 @@ async def amain() -> None:
     ttl_seconds = float(os.getenv("AGENT_TTL_SECONDS", "40"))
     gc_interval = float(os.getenv("GC_INTERVAL_SECONDS", "5"))
     heartbeat_interval = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "12"))
+    thread_soft_limit_tokens = int(os.getenv("THREAD_SOFT_LIMIT_TOKENS", "50000"))
+    thread_hard_limit_tokens = int(os.getenv("THREAD_HARD_LIMIT_TOKENS", "60000"))
+    token_estimate_chars_per_token = float(os.getenv("TOKEN_ESTIMATE_CHARS_PER_TOKEN", "4"))
     server_id = os.getenv("REGISTRY_SERVER_ID", "registry")
     database_url = os.getenv("DATABASE_URL")
     retention_days = float(os.getenv("SESSION_RETENTION_DAYS", "14"))
@@ -1386,6 +1593,9 @@ async def amain() -> None:
         ttl_seconds=ttl_seconds,
         gc_interval_seconds=gc_interval,
         heartbeat_interval_seconds=heartbeat_interval,
+        thread_soft_limit_tokens=thread_soft_limit_tokens,
+        thread_hard_limit_tokens=thread_hard_limit_tokens,
+        token_estimate_chars_per_token=token_estimate_chars_per_token,
         server_id=server_id,
         database_url=database_url,
         session_retention_days=retention_days,
