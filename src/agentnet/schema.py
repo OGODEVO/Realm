@@ -71,8 +71,11 @@ class AgentMessage:
     ttl_ms: int | None = None
     expires_at: str | None = None
     trace_id: str | None = None
+    thread_id: str | None = None
+    parent_message_id: str | None = None
     kind: str = "direct"
     reply_to: str | None = None
+    auth: dict[str, Any] | None = None
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "AgentMessage":
@@ -95,8 +98,11 @@ class AgentMessage:
             ttl_ms=ttl_ms,
             expires_at=str(data.get("expires_at") or "") or None,
             trace_id=str(data.get("trace_id") or "") or None,
+            thread_id=str(data.get("thread_id") or "") or None,
+            parent_message_id=str(data.get("parent_message_id") or "") or None,
             kind=str(data.get("kind") or "direct"),
             reply_to=data.get("reply_to"),
+            auth=data.get("auth") if isinstance(data.get("auth"), dict) else None,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -120,6 +126,67 @@ class AgentMessage:
             payload_dict["expires_at"] = self.expires_at
         if self.trace_id is not None:
             payload_dict["trace_id"] = self.trace_id
+        if self.thread_id is not None:
+            payload_dict["thread_id"] = self.thread_id
+        if self.parent_message_id is not None:
+            payload_dict["parent_message_id"] = self.parent_message_id
         if self.reply_to is not None:
             payload_dict["reply_to"] = self.reply_to
+        if self.auth is not None:
+            payload_dict["auth"] = self.auth
         return payload_dict
+
+
+@dataclass(slots=True)
+class DeliveryReceipt:
+    message_id: str
+    status: str
+    event_at: str
+    from_account_id: str | None = None
+    from_session_tag: str | None = None
+    to_account_id: str | None = None
+    trace_id: str | None = None
+    thread_id: str | None = None
+    parent_message_id: str | None = None
+    code: str | None = None
+    detail: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> "DeliveryReceipt":
+        return cls(
+            message_id=str(data.get("message_id") or ""),
+            status=str(data.get("status") or ""),
+            event_at=str(data.get("event_at") or ""),
+            from_account_id=str(data.get("from_account_id") or "") or None,
+            from_session_tag=str(data.get("from_session_tag") or "") or None,
+            to_account_id=str(data.get("to_account_id") or "") or None,
+            trace_id=str(data.get("trace_id") or "") or None,
+            thread_id=str(data.get("thread_id") or "") or None,
+            parent_message_id=str(data.get("parent_message_id") or "") or None,
+            code=str(data.get("code") or "") or None,
+            detail=str(data.get("detail") or "") or None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "message_id": self.message_id,
+            "status": self.status,
+            "event_at": self.event_at,
+        }
+        if self.from_account_id is not None:
+            payload["from_account_id"] = self.from_account_id
+        if self.from_session_tag is not None:
+            payload["from_session_tag"] = self.from_session_tag
+        if self.to_account_id is not None:
+            payload["to_account_id"] = self.to_account_id
+        if self.trace_id is not None:
+            payload["trace_id"] = self.trace_id
+        if self.thread_id is not None:
+            payload["thread_id"] = self.thread_id
+        if self.parent_message_id is not None:
+            payload["parent_message_id"] = self.parent_message_id
+        if self.code is not None:
+            payload["code"] = self.code
+        if self.detail is not None:
+            payload["detail"] = self.detail
+        return payload

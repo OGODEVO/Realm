@@ -11,3 +11,22 @@ wheels/
 venv/
 .env
 agents/.env
+.keys/
+
+# Databases and Caches
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Common IDEs and Caches
+.vscode/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node dependencies
+node_modules/

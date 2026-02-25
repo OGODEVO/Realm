@@ -28,6 +28,9 @@ services:
       HEARTBEAT_INTERVAL_SECONDS: "12"
       GC_INTERVAL_SECONDS: "5"
       REGISTRY_SERVER_ID: "registry"
+      DEV_AUTH: "${DEV_AUTH:-false}"
+      DEV_AUTH_MAX_SKEW_SECONDS: "${DEV_AUTH_MAX_SKEW_SECONDS:-120}"
+      DEV_AUTH_NONCE_TTL_SECONDS: "${DEV_AUTH_NONCE_TTL_SECONDS:-300}"
     depends_on:
       - nats
       - postgres
