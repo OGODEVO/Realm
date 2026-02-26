@@ -9,9 +9,9 @@ services:
   postgres:
     image: postgres:16-alpine
     environment:
-      POSTGRES_DB: agentnet
-      POSTGRES_USER: agentnet
-      POSTGRES_PASSWORD: agentnet
+      POSTGRES_DB: ${POSTGRES_DB:-agentnet}
+      POSTGRES_USER: ${POSTGRES_USER:-agentnet}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local}
     volumes:
       - agentnet_pg_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -22,7 +22,7 @@ services:
       dockerfile: services/registry/Dockerfile
     environment:
       NATS_URL: nats://agentnet_secret_token@nats:4222
-      DATABASE_URL: postgresql://agentnet:agentnet@postgres:5432/agentnet
+      DATABASE_URL: ${DATABASE_URL:-postgresql://agentnet:change_me_local@postgres:5432/agentnet}
       SESSION_RETENTION_DAYS: "14"
       AGENT_TTL_SECONDS: "40"
       HEARTBEAT_INTERVAL_SECONDS: "12"
