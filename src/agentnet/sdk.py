@@ -222,6 +222,7 @@ class AgentWrapper:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         require_delivery_ack: bool = True,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
@@ -236,6 +237,7 @@ class AgentWrapper:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -249,6 +251,7 @@ class AgentWrapper:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -262,6 +265,7 @@ class AgentWrapper:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -281,6 +285,7 @@ class AgentWrapper:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> AgentMessage:
         self._validate_target(to_account_id=to_account_id, to_username=to_username, to_capability=to_capability)
         if to_account_id is not None:
@@ -293,6 +298,7 @@ class AgentWrapper:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
             self._raise_if_error_reply(reply)
             return reply
@@ -306,6 +312,7 @@ class AgentWrapper:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
             self._raise_if_error_reply(reply)
             return reply
@@ -319,6 +326,7 @@ class AgentWrapper:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
             self._raise_if_error_reply(reply)
             return reply
@@ -371,6 +379,67 @@ class AgentWrapper:
     ) -> dict[str, Any]:
         return await self._node.get_profile(account_id=account_id, username=username, timeout=timeout)
 
+    async def list_threads(
+        self,
+        *,
+        participant_account_id: str | None = None,
+        participant_username: str | None = None,
+        query: str = "",
+        limit: int = 20,
+        soft_limit_tokens: int | None = None,
+        hard_limit_tokens: int | None = None,
+        timeout: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        return await self._node.list_threads(
+            participant_account_id=participant_account_id,
+            participant_username=participant_username,
+            query=query,
+            limit=limit,
+            soft_limit_tokens=soft_limit_tokens,
+            hard_limit_tokens=hard_limit_tokens,
+            timeout=timeout,
+        )
+
+    async def get_thread_messages(
+        self,
+        *,
+        thread_id: str,
+        limit: int = 50,
+        cursor: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        return await self._node.get_thread_messages(
+            thread_id=thread_id,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+
+    async def search_messages(
+        self,
+        *,
+        thread_id: str | None = None,
+        from_account_id: str | None = None,
+        to_account_id: str | None = None,
+        kind: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        return await self._node.search_messages(
+            thread_id=thread_id,
+            from_account_id=from_account_id,
+            to_account_id=to_account_id,
+            kind=kind,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+
     @staticmethod
     def _validate_target(
         *,
@@ -406,6 +475,7 @@ class ThreadSession:
         text: str,
         *,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         parent = parent_message_id if parent_message_id is not None else self.parent_message_id
         result = await self._sdk.send_text(
@@ -413,6 +483,7 @@ class ThreadSession:
             text,
             thread_id=self.thread_id,
             parent_message_id=parent,
+            idempotency_key=idempotency_key,
         )
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
@@ -424,6 +495,7 @@ class ThreadSession:
         *,
         timeout: float | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         parent = parent_message_id if parent_message_id is not None else self.parent_message_id
         result = await self._sdk.ask_text(
@@ -432,6 +504,7 @@ class ThreadSession:
             thread_id=self.thread_id,
             timeout=timeout,
             parent_message_id=parent,
+            idempotency_key=idempotency_key,
         )
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
@@ -442,6 +515,7 @@ class ThreadSession:
         data: Any,
         *,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         parent = parent_message_id if parent_message_id is not None else self.parent_message_id
         result = await self._sdk.send_json(
@@ -449,6 +523,7 @@ class ThreadSession:
             data,
             thread_id=self.thread_id,
             parent_message_id=parent,
+            idempotency_key=idempotency_key,
         )
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
@@ -460,6 +535,7 @@ class ThreadSession:
         *,
         timeout: float | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         parent = parent_message_id if parent_message_id is not None else self.parent_message_id
         result = await self._sdk.ask_json(
@@ -468,6 +544,7 @@ class ThreadSession:
             thread_id=self.thread_id,
             timeout=timeout,
             parent_message_id=parent,
+            idempotency_key=idempotency_key,
         )
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
@@ -583,6 +660,67 @@ class AgentSDK:
             timeout=timeout,
         )
 
+    async def list_threads(
+        self,
+        *,
+        participant_account_id: str | None = None,
+        participant_username: str | None = None,
+        query: str = "",
+        limit: int = 20,
+        soft_limit_tokens: int | None = None,
+        hard_limit_tokens: int | None = None,
+        timeout: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        return await self._node.list_threads(
+            participant_account_id=participant_account_id,
+            participant_username=participant_username,
+            query=query,
+            limit=limit,
+            soft_limit_tokens=soft_limit_tokens,
+            hard_limit_tokens=hard_limit_tokens,
+            timeout=timeout,
+        )
+
+    async def get_thread_messages(
+        self,
+        *,
+        thread_id: str,
+        limit: int = 50,
+        cursor: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        return await self._node.get_thread_messages(
+            thread_id=thread_id,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+
+    async def search_messages(
+        self,
+        *,
+        thread_id: str | None = None,
+        from_account_id: str | None = None,
+        to_account_id: str | None = None,
+        kind: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        return await self._node.search_messages(
+            thread_id=thread_id,
+            from_account_id=from_account_id,
+            to_account_id=to_account_id,
+            kind=kind,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+
     async def send_text(
         self,
         to: str,
@@ -590,12 +728,14 @@ class AgentSDK:
         *,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         return await self.send_json(
             to,
             {"text": str(text)},
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
 
     async def ask_text(
@@ -606,6 +746,7 @@ class AgentSDK:
         thread_id: str | None = None,
         timeout: float | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         return await self.ask_json(
             to,
@@ -613,6 +754,7 @@ class AgentSDK:
             thread_id=thread_id,
             timeout=timeout,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
 
     async def send_json(
@@ -622,6 +764,7 @@ class AgentSDK:
         *,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         require_delivery_ack: bool = True,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
@@ -634,6 +777,7 @@ class AgentSDK:
             payload=data,
             thread_id=effective_thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
             require_delivery_ack=require_delivery_ack,
             retry_attempts=retry_attempts,
             receipt_timeout=receipt_timeout,
@@ -655,6 +799,7 @@ class AgentSDK:
         thread_id: str | None = None,
         timeout: float | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> SDKResult:
         kind, value = _parse_target_value(to)
         effective_thread_id = self._normalize_thread_id(thread_id)
@@ -665,6 +810,7 @@ class AgentSDK:
             timeout=timeout if timeout is not None else self.default_request_timeout,
             thread_id=effective_thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
         _raise_if_error_reply(reply)
         return SDKResult(
@@ -691,6 +837,7 @@ class AgentSDK:
         payload: Any,
         thread_id: str,
         parent_message_id: str | None,
+        idempotency_key: str | None,
         require_delivery_ack: bool,
         retry_attempts: int | None,
         receipt_timeout: float | None,
@@ -701,6 +848,7 @@ class AgentSDK:
                 payload=payload,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -711,6 +859,7 @@ class AgentSDK:
                 payload=payload,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -721,6 +870,7 @@ class AgentSDK:
                 payload=payload,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -736,6 +886,7 @@ class AgentSDK:
         timeout: float,
         thread_id: str,
         parent_message_id: str | None,
+        idempotency_key: str | None,
     ) -> AgentMessage:
         safe_timeout = max(0.1, float(timeout))
         if target_kind == "username":
@@ -745,6 +896,7 @@ class AgentSDK:
                 timeout=safe_timeout,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
         if target_kind == "account":
             return await self._node.request_account(
@@ -753,6 +905,7 @@ class AgentSDK:
                 timeout=safe_timeout,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
         if target_kind == "capability":
             return await self._node.request_capability(
@@ -761,5 +914,6 @@ class AgentSDK:
                 timeout=safe_timeout,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
         raise ValueError(f"unsupported target kind: {target_kind}")

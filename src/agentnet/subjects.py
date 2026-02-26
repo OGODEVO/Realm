@@ -9,6 +9,9 @@ REGISTRY_RESOLVE_KEY_SUBJECT = "registry.resolve_key"
 REGISTRY_SEARCH_SUBJECT = "registry.search"
 REGISTRY_PROFILE_SUBJECT = "registry.profile"
 REGISTRY_THREAD_STATUS_SUBJECT = "registry.thread_status"
+REGISTRY_THREAD_LIST_SUBJECT = "registry.thread_list"
+REGISTRY_THREAD_MESSAGES_SUBJECT = "registry.thread_messages"
+REGISTRY_MESSAGE_SEARCH_SUBJECT = "registry.message_search"
 
 
 def account_inbox_subject(account_id: str) -> str:

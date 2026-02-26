@@ -38,7 +38,7 @@ class AgentRunner(NetworkAgent):
     _agent1_focus_by_thread: dict[str, dict[str, str]] = field(init=False)
 
     def __post_init__(self) -> None:
-        super().__post_init__()
+        NetworkAgent.__post_init__(self)
         self._agent1_orchestrate = self._env_bool("MESH_AGENT1_ORCHESTRATE", default=False)
         self._agent1_peers = self._parse_agent1_peers(os.getenv("MESH_AGENT1_PEERS", "mesh_agent_2,mesh_agent_3"))
         self._agent1_rounds = max(1, int(os.getenv("MESH_AGENT1_DEBATE_ROUNDS", "2")))

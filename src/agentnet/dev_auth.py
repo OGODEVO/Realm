@@ -119,6 +119,8 @@ def build_message_claims(
     thread_id: str | None,
     parent_message_id: str | None,
     kind: str,
+    schema_version: str | None,
+    idempotency_key: str | None,
     payload: Any,
 ) -> dict[str, str]:
     return {
@@ -133,6 +135,8 @@ def build_message_claims(
         "thread_id": thread_id or "",
         "parent_message_id": parent_message_id or "",
         "kind": kind,
+        "schema_version": schema_version or "1.0",
+        "idempotency_key": idempotency_key or "",
         "payload_sha256": payload_digest_hex(payload),
     }
 
