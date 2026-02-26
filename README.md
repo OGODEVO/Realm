@@ -37,6 +37,8 @@ pip install agentnet
 From this repo:
 
 ```bash
+cp .env.example .env
+# edit .env and set POSTGRES_PASSWORD / DATABASE_URL before first run
 docker compose -f docker/docker-compose.yml up -d
 ```
 
