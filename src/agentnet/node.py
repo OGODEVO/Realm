@@ -27,12 +27,18 @@ from agentnet.dev_auth import (
 from agentnet.registry import (
     get_profile,
     get_profile_with_client,
+    get_thread_messages,
+    get_thread_messages_with_client,
+    list_threads,
+    list_threads_with_client,
     list_online_agents,
     list_online_agents_with_client,
     resolve_dev_public_key_by_account,
     resolve_dev_public_key_by_account_with_client,
     resolve_account_by_username,
     resolve_account_by_username_with_client,
+    search_messages,
+    search_messages_with_client,
     search_profiles,
     search_profiles_with_client,
 )
@@ -75,6 +81,8 @@ class AgentNode:
         circuit_breaker_reset_seconds: float = 15.0,
         default_send_retry_attempts: int = 2,
         default_receipt_timeout_seconds: float = 1.5,
+        default_schema_version: str = "1.1",
+        supported_schema_major: int = 1,
         dev_auth_enabled: bool | None = None,
         dev_auth_key_dir: str | None = None,
         dev_auth_key_cache_seconds: float = 300.0,
@@ -102,6 +110,8 @@ class AgentNode:
         self.circuit_breaker_reset_seconds = max(1.0, circuit_breaker_reset_seconds)
         self.default_send_retry_attempts = max(0, default_send_retry_attempts)
         self.default_receipt_timeout_seconds = max(0.2, default_receipt_timeout_seconds)
+        self.default_schema_version = str(default_schema_version or "1.1")
+        self.supported_schema_major = max(1, int(supported_schema_major))
         self.dev_auth_enabled = (
             parse_bool(os.getenv("DEV_AUTH"), default=False) if dev_auth_enabled is None else bool(dev_auth_enabled)
         )
@@ -122,6 +132,7 @@ class AgentNode:
 
         self._sender_buckets: dict[str, tuple[float, float]] = {}
         self._seen_message_ids: dict[str, float] = {}
+        self._seen_idempotency_keys: dict[str, float] = {}
 
         self._consecutive_failures = 0
         self._circuit_open_until = 0.0
@@ -276,6 +287,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         require_delivery_ack: bool = True,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
@@ -290,6 +302,7 @@ class AgentNode:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -304,6 +317,7 @@ class AgentNode:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
                 require_delivery_ack=require_delivery_ack,
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
@@ -322,6 +336,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         require_delivery_ack: bool = True,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
@@ -339,6 +354,7 @@ class AgentNode:
             to_account_id=account_id,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
         await self._publish_with_retry(
             nc=nc,
@@ -359,6 +375,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         require_delivery_ack: bool = True,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
@@ -373,6 +390,7 @@ class AgentNode:
             trace_id=trace_id,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
             require_delivery_ack=require_delivery_ack,
             retry_attempts=retry_attempts,
             receipt_timeout=receipt_timeout,
@@ -387,6 +405,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         require_delivery_ack: bool = True,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
@@ -400,6 +419,7 @@ class AgentNode:
             trace_id=trace_id,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
         await self._publish_with_retry(
             nc=nc,
@@ -421,6 +441,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> AgentMessage:
         explicit_account_id = self._parse_account_target(to)
         if explicit_account_id:
@@ -433,6 +454,7 @@ class AgentNode:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
         explicit_username = self._parse_username_target(to)
         if explicit_username:
@@ -445,6 +467,7 @@ class AgentNode:
                 trace_id=trace_id,
                 thread_id=thread_id,
                 parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
             )
         raise ValueError(
             "Routing target must be account:<account_id>, acct_..., username:<name>, or @name. "
@@ -461,6 +484,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> AgentMessage:
         account_id = to_account_id.strip()
         if not account_id:
@@ -475,6 +499,7 @@ class AgentNode:
             to_account_id=account_id,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
         reply_msg = await nc.request(account_inbox_subject(account_id), self._encode_message(envelope), timeout=timeout)
         data = decode_json(reply_msg.data)
@@ -492,6 +517,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
         lookup_timeout: float = 2.0,
     ) -> AgentMessage:
         account_id = await self.resolve_account_id_by_username(username, timeout=lookup_timeout)
@@ -504,6 +530,7 @@ class AgentNode:
             trace_id=trace_id,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
 
     async def reply(
@@ -562,6 +589,7 @@ class AgentNode:
         trace_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> AgentMessage:
         nc = self._require_connected_client()
         envelope = self._build_outbound_message(
@@ -572,6 +600,7 @@ class AgentNode:
             trace_id=trace_id,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
         )
         reply_msg = await nc.request(agent_capability_subject(capability), self._encode_message(envelope), timeout=timeout)
         data = decode_json(reply_msg.data)
@@ -629,6 +658,102 @@ class AgentNode:
             self.nats_url,
             account_id=account_id,
             username=username,
+            timeout=timeout,
+        )
+
+    async def list_threads(
+        self,
+        *,
+        participant_account_id: str | None = None,
+        participant_username: str | None = None,
+        query: str = "",
+        limit: int = 20,
+        soft_limit_tokens: int | None = None,
+        hard_limit_tokens: int | None = None,
+        timeout: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        if self._nc and self._nc.is_connected:
+            return await list_threads_with_client(
+                self._nc,
+                participant_account_id=participant_account_id,
+                participant_username=participant_username,
+                query=query,
+                limit=limit,
+                soft_limit_tokens=soft_limit_tokens,
+                hard_limit_tokens=hard_limit_tokens,
+                timeout=timeout,
+            )
+        return await list_threads(
+            self.nats_url,
+            participant_account_id=participant_account_id,
+            participant_username=participant_username,
+            query=query,
+            limit=limit,
+            soft_limit_tokens=soft_limit_tokens,
+            hard_limit_tokens=hard_limit_tokens,
+            timeout=timeout,
+        )
+
+    async def get_thread_messages(
+        self,
+        *,
+        thread_id: str,
+        limit: int = 50,
+        cursor: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        if self._nc and self._nc.is_connected:
+            return await get_thread_messages_with_client(
+                self._nc,
+                thread_id=thread_id,
+                limit=limit,
+                cursor=cursor,
+                timeout=timeout,
+            )
+        return await get_thread_messages(
+            self.nats_url,
+            thread_id=thread_id,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+
+    async def search_messages(
+        self,
+        *,
+        thread_id: str | None = None,
+        from_account_id: str | None = None,
+        to_account_id: str | None = None,
+        kind: str | None = None,
+        from_ts: str | None = None,
+        to_ts: str | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+        timeout: float = 2.0,
+    ) -> dict[str, Any]:
+        if self._nc and self._nc.is_connected:
+            return await search_messages_with_client(
+                self._nc,
+                thread_id=thread_id,
+                from_account_id=from_account_id,
+                to_account_id=to_account_id,
+                kind=kind,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                cursor=cursor,
+                timeout=timeout,
+            )
+        return await search_messages(
+            self.nats_url,
+            thread_id=thread_id,
+            from_account_id=from_account_id,
+            to_account_id=to_account_id,
+            kind=kind,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=limit,
+            cursor=cursor,
             timeout=timeout,
         )
 
@@ -757,6 +882,18 @@ class AgentNode:
         if not message.thread_id:
             message.thread_id = f"thread_{(message.trace_id or message.message_id or new_ulid()).lower()}"
 
+        schema_error = self._validate_schema_version(message)
+        if schema_error is not None:
+            self._dropped_count += 1
+            await self._emit_delivery_receipt(
+                message=message,
+                status="rejected",
+                code=schema_error,
+                detail="message schema_version is not supported",
+            )
+            await self._maybe_reply_error(message, schema_error, "message schema_version is not supported")
+            return
+
         now = time.monotonic()
         self._cleanup_tracking_state(now)
 
@@ -835,6 +972,19 @@ class AgentNode:
             await self._maybe_reply_error(message, "duplicate", "message_id has already been processed")
             return
 
+        idempotency_scope = self._idempotency_scope_key(message)
+        if idempotency_scope and idempotency_scope in self._seen_idempotency_keys:
+            self._duplicate_count += 1
+            self._dropped_count += 1
+            await self._emit_delivery_receipt(
+                message=message,
+                status="rejected",
+                code="duplicate",
+                detail="idempotency_key has already been processed",
+            )
+            await self._maybe_reply_error(message, "duplicate", "idempotency_key has already been processed")
+            return
+
         queue = self._incoming_queue
         if queue is None or queue.full():
             self._busy_count += 1
@@ -850,6 +1000,8 @@ class AgentNode:
 
         if message.message_id:
             self._seen_message_ids[message.message_id] = now + self.dedupe_ttl_seconds
+        if idempotency_scope:
+            self._seen_idempotency_keys[idempotency_scope] = now + self.dedupe_ttl_seconds
         queue.put_nowait(message)
         await self._emit_delivery_receipt(message=message, status="accepted")
 
@@ -979,6 +1131,26 @@ class AgentNode:
             return "expired"
         return None
 
+    def _validate_schema_version(self, message: AgentMessage) -> str | None:
+        raw_version = str(message.schema_version or "").strip() or "1.0"
+        major_raw = raw_version.split(".", 1)[0]
+        try:
+            major = int(major_raw)
+        except (TypeError, ValueError):
+            return "schema_version_invalid"
+        if major != self.supported_schema_major:
+            return "unsupported_schema_version"
+        message.schema_version = raw_version
+        return None
+
+    def _idempotency_scope_key(self, message: AgentMessage) -> str | None:
+        key = str(message.idempotency_key or "").strip()
+        if not key:
+            return None
+        sender = str(message.from_account_id or "").strip() or str(message.from_session_tag or "").strip() or str(message.from_agent or "").strip()
+        receiver = str(self.account_id or "").strip() or self.agent_id
+        return f"{sender}|{receiver}|{key}"
+
     @staticmethod
     def _min_datetime(first: datetime | None, second: datetime | None) -> datetime | None:
         if first is None:
@@ -1012,6 +1184,7 @@ class AgentNode:
         to_account_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
     ) -> AgentMessage:
         message_id = new_id()
         sent_at = utc_now_iso()
@@ -1024,6 +1197,7 @@ class AgentNode:
             except (TypeError, ValueError):
                 effective_ttl = self.default_ttl_ms
         expires_at = self._build_expiry_from_sent(sent_at, effective_ttl)
+        normalized_idempotency_key = str(idempotency_key or "").strip() or None
         return AgentMessage(
             message_id=message_id,
             from_agent=self.agent_id,
@@ -1039,6 +1213,8 @@ class AgentNode:
             thread_id=resolved_thread_id,
             parent_message_id=parent_message_id,
             kind=kind,
+            schema_version=self.default_schema_version,
+            idempotency_key=normalized_idempotency_key,
             auth=self._build_message_auth(
                 message_id=message_id,
                 to_agent=to,
@@ -1051,6 +1227,8 @@ class AgentNode:
                 parent_message_id=parent_message_id,
                 kind=kind,
                 to_account_id=to_account_id,
+                schema_version=self.default_schema_version,
+                idempotency_key=normalized_idempotency_key,
             ),
         )
 
@@ -1091,6 +1269,7 @@ class AgentNode:
             thread_id=request.thread_id or f"thread_{(request.trace_id or request.message_id or new_ulid()).lower()}",
             parent_message_id=request.message_id or None,
             kind="error",
+            schema_version=self.default_schema_version,
         )
         if self.dev_auth_enabled:
             error_reply.auth = self._build_message_auth(
@@ -1105,6 +1284,8 @@ class AgentNode:
                 parent_message_id=error_reply.parent_message_id,
                 kind=error_reply.kind,
                 to_account_id=error_reply.to_account_id,
+                schema_version=error_reply.schema_version,
+                idempotency_key=error_reply.idempotency_key,
             )
         try:
             await nc.publish(request.reply_to, self._encode_message(error_reply))
@@ -1115,6 +1296,10 @@ class AgentNode:
         seen_cutoff_keys = [key for key, expiry in self._seen_message_ids.items() if expiry <= now]
         for key in seen_cutoff_keys:
             self._seen_message_ids.pop(key, None)
+
+        idempotency_cutoff_keys = [key for key, expiry in self._seen_idempotency_keys.items() if expiry <= now]
+        for key in idempotency_cutoff_keys:
+            self._seen_idempotency_keys.pop(key, None)
 
         bucket_cutoff = now - self.dedupe_ttl_seconds
         stale_sender_keys = [key for key, (_, ts) in self._sender_buckets.items() if ts <= bucket_cutoff]
@@ -1261,6 +1446,8 @@ class AgentNode:
         parent_message_id: str | None,
         kind: str,
         to_account_id: str | None,
+        schema_version: str | None,
+        idempotency_key: str | None,
     ) -> dict[str, Any] | None:
         if not self.dev_auth_enabled:
             return None
@@ -1278,6 +1465,8 @@ class AgentNode:
             thread_id=thread_id,
             parent_message_id=parent_message_id,
             kind=kind,
+            schema_version=schema_version,
+            idempotency_key=idempotency_key,
             payload=payload,
         )
         signature = sign_claims(private_key_b64=private_key, claims=claims)
@@ -1321,11 +1510,17 @@ class AgentNode:
             thread_id=message.thread_id,
             parent_message_id=message.parent_message_id,
             kind=message.kind,
+            schema_version=message.schema_version,
+            idempotency_key=message.idempotency_key,
             payload=message.payload,
         )
         claims_str = {str(k): str(v) for k, v in claims.items()}
         if claims_str != expected_claims:
-            return "auth_claims_mismatch"
+            legacy_expected_claims = dict(expected_claims)
+            legacy_expected_claims.pop("schema_version", None)
+            legacy_expected_claims.pop("idempotency_key", None)
+            if claims_str != legacy_expected_claims:
+                return "auth_claims_mismatch"
         if not verify_claims(public_key_b64=public_key, claims=claims_str, signature_b64=signature):
             return "auth_signature_invalid"
         return None

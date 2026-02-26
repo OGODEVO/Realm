@@ -2,6 +2,9 @@
 
 `agentnet` is a lightweight Python package that lets agents discover each other and exchange direct messages over NATS.
 
+Network operator reference: [`NETWORK_CLI_GUIDE.md`](NETWORK_CLI_GUIDE.md)
+UI integration reference: [`UI_BACKEND_MAPPING.md`](UI_BACKEND_MAPPING.md)
+
 ## Features
 
 - Agents join the network with a single `AgentNode`
@@ -9,7 +12,12 @@
 - Online registry with agent metadata and capabilities
 - Thread-aware messaging (`thread_id`, `parent_message_id`)
 - Discovery RPCs (`registry.search`, `registry.profile`)
+- Thread discovery RPC (`registry.thread_list`)
+- Thread history RPC (`registry.thread_messages`) with cursor pagination
+- Message search RPC (`registry.message_search`) with filters
 - Thread budget status RPC (`registry.thread_status`) for compaction signaling
+- Envelope protocol versioning (`schema_version`) with backward-compatible defaulting
+- Optional idempotency keys (`idempotency_key`) to suppress duplicate logical operations
 - Delivery receipts with sender retry policy
 - Async-first API for scripts and long-running workers
 - Bounded in-process concurrency (worker cap + pending queue cap)
@@ -36,7 +44,7 @@ This starts:
 
 - NATS on `localhost:4222`
 - Postgres for durable session metadata
-- Registry service subscribed to `registry.register`, `registry.hello`, `registry.goodbye`, `registry.list`, `registry.search`, and `registry.profile`
+- Registry service subscribed to `registry.register`, `registry.hello`, `registry.goodbye`, `registry.list`, `registry.search`, `registry.profile`, `registry.thread_list`, `registry.thread_messages`, `registry.message_search`, and `registry.thread_status`
 
 ### 3) Integrate into your agent (5-10 lines)
 
@@ -105,6 +113,9 @@ LLM local tool wrappers can directly call:
 - `sdk.get_profile(target)`
 - `sdk.ask_text(to, text, thread_id=...)`
 - `sdk.send_text(to, text, thread_id=...)`
+- `sdk.list_threads(...)`
+- `sdk.get_thread_messages(thread_id, limit=..., cursor=...)`
+- `sdk.search_messages(...)`
 - `sdk.thread_status(thread_id)`
 
 Under the hood this publishes to:
@@ -153,6 +164,15 @@ agentnet chat --nats-url nats://agentnet_secret_token@localhost:4222 --to-userna
 
 # Inspect a thread's token budget status (ok / warn / needs_compaction)
 agentnet thread-status --nats-url nats://agentnet_secret_token@localhost:4222 --thread-id ops_thread_1
+
+# Discover old threads and pick one to resume
+agentnet threads --nats-url nats://agentnet_secret_token@localhost:4222 --participant-username mesh_agent_1 --limit 20
+
+# Page through messages inside one thread
+agentnet thread-messages --nats-url nats://agentnet_secret_token@localhost:4222 --thread-id ops_thread_1 --limit 50
+
+# Search messages by filters
+agentnet message-search --nats-url nats://agentnet_secret_token@localhost:4222 --thread-id ops_thread_1 --kind request --limit 50
 ```
 
 `agentnet chat` commands:
@@ -160,6 +180,12 @@ agentnet thread-status --nats-url nats://agentnet_secret_token@localhost:4222 --
 - `/showthread` prints current thread id
 - `/thread <id>` switches thread context
 - `/quit` exits interactive mode
+
+`agentnet threads` outputs:
+
+- recent matching thread IDs
+- per-thread status (`ok` / `warn` / `needs_compaction`)
+- message/token counts and last activity time
 
 `agentnet thread-status` outputs:
 
@@ -237,6 +263,9 @@ Thread/message persistence:
 - Key resolve (request/reply): `registry.resolve_key`
 - Search (request/reply): `registry.search`
 - Profile (request/reply): `registry.profile`
+- Thread list (request/reply): `registry.thread_list`
+- Thread messages (request/reply): `registry.thread_messages`
+- Message search (request/reply): `registry.message_search`
 - Thread status (request/reply): `registry.thread_status`
 - Presence hello: `registry.hello`
 - Presence goodbye: `registry.goodbye`
@@ -260,6 +289,8 @@ Thread/message persistence:
   "thread_id": "thread_b3d0...",
   "parent_message_id": null,
   "kind": "direct",
+  "schema_version": "1.1",
+  "idempotency_key": "order_123_step_1",
   "auth": {
     "scheme": "dev-ed25519-v1",
     "public_key": "<base64url>",

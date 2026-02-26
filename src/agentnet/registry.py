@@ -10,11 +10,14 @@ from nats.errors import NoServersError, TimeoutError
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.schema import AgentInfo
 from agentnet.subjects import (
+    REGISTRY_MESSAGE_SEARCH_SUBJECT,
     REGISTRY_LIST_SUBJECT,
     REGISTRY_PROFILE_SUBJECT,
     REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
     REGISTRY_RESOLVE_KEY_SUBJECT,
     REGISTRY_SEARCH_SUBJECT,
+    REGISTRY_THREAD_LIST_SUBJECT,
+    REGISTRY_THREAD_MESSAGES_SUBJECT,
     REGISTRY_THREAD_STATUS_SUBJECT,
 )
 from agentnet.utils import decode_json, encode_json
@@ -329,4 +332,226 @@ async def get_thread_status_with_client(
         raise RuntimeError("registry.thread_status response must be an object")
     if "error" in data:
         raise RuntimeError(str(data.get("error") or "thread_status_failed"))
+    return data
+
+
+async def list_threads(
+    nats_url: str,
+    *,
+    participant_account_id: str | None = None,
+    participant_username: str | None = None,
+    query: str = "",
+    limit: int = 20,
+    soft_limit_tokens: int | None = None,
+    hard_limit_tokens: int | None = None,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await list_threads_with_client(
+            nc,
+            participant_account_id=participant_account_id,
+            participant_username=participant_username,
+            query=query,
+            limit=limit,
+            soft_limit_tokens=soft_limit_tokens,
+            hard_limit_tokens=hard_limit_tokens,
+            timeout=timeout,
+        )
+    finally:
+        await nc.drain()
+
+
+async def list_threads_with_client(
+    nc: NATS,
+    *,
+    participant_account_id: str | None = None,
+    participant_username: str | None = None,
+    query: str = "",
+    limit: int = 20,
+    soft_limit_tokens: int | None = None,
+    hard_limit_tokens: int | None = None,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    safe_limit = max(1, min(int(limit), 100))
+    payload: dict[str, Any] = {
+        "query": str(query or "").strip(),
+        "limit": safe_limit,
+    }
+    if participant_account_id:
+        payload["participant_account_id"] = participant_account_id.strip()
+    if participant_username:
+        payload["participant_username"] = participant_username.strip().lower().lstrip("@")
+    if soft_limit_tokens is not None:
+        payload["soft_limit_tokens"] = max(1, int(soft_limit_tokens))
+    if hard_limit_tokens is not None:
+        payload["hard_limit_tokens"] = max(1, int(hard_limit_tokens))
+
+    try:
+        response = await nc.request(REGISTRY_THREAD_LIST_SUBJECT, encode_json(payload), timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.thread_list") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.thread_list response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "thread_list_failed"))
+    results = data.get("results")
+    if not isinstance(results, list):
+        return []
+    return [item for item in results if isinstance(item, dict)]
+
+
+async def get_thread_messages(
+    nats_url: str,
+    *,
+    thread_id: str,
+    limit: int = 50,
+    cursor: str | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await get_thread_messages_with_client(
+            nc,
+            thread_id=thread_id,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+    finally:
+        await nc.drain()
+
+
+async def get_thread_messages_with_client(
+    nc: NATS,
+    *,
+    thread_id: str,
+    limit: int = 50,
+    cursor: str | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    normalized_thread_id = str(thread_id or "").strip()
+    if not normalized_thread_id:
+        raise ValueError("thread_id is required")
+    payload: dict[str, Any] = {
+        "thread_id": normalized_thread_id,
+        "limit": max(1, min(int(limit), 200)),
+    }
+    normalized_cursor = str(cursor or "").strip()
+    if normalized_cursor:
+        payload["cursor"] = normalized_cursor
+    try:
+        response = await nc.request(REGISTRY_THREAD_MESSAGES_SUBJECT, encode_json(payload), timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.thread_messages") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.thread_messages response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "thread_messages_failed"))
+    return data
+
+
+async def search_messages(
+    nats_url: str,
+    *,
+    thread_id: str | None = None,
+    from_account_id: str | None = None,
+    to_account_id: str | None = None,
+    kind: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await search_messages_with_client(
+            nc,
+            thread_id=thread_id,
+            from_account_id=from_account_id,
+            to_account_id=to_account_id,
+            kind=kind,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+    finally:
+        await nc.drain()
+
+
+async def search_messages_with_client(
+    nc: NATS,
+    *,
+    thread_id: str | None = None,
+    from_account_id: str | None = None,
+    to_account_id: str | None = None,
+    kind: str | None = None,
+    from_ts: str | None = None,
+    to_ts: str | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "limit": max(1, min(int(limit), 200)),
+    }
+    if thread_id:
+        payload["thread_id"] = str(thread_id).strip()
+    if from_account_id:
+        payload["from_account_id"] = str(from_account_id).strip()
+    if to_account_id:
+        payload["to_account_id"] = str(to_account_id).strip()
+    if kind:
+        payload["kind"] = str(kind).strip()
+    if from_ts:
+        payload["from_ts"] = str(from_ts).strip()
+    if to_ts:
+        payload["to_ts"] = str(to_ts).strip()
+    normalized_cursor = str(cursor or "").strip()
+    if normalized_cursor:
+        payload["cursor"] = normalized_cursor
+    try:
+        response = await nc.request(REGISTRY_MESSAGE_SEARCH_SUBJECT, encode_json(payload), timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.message_search") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.message_search response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "message_search_failed"))
     return data

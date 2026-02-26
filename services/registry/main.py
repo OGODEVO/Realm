@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import math
@@ -23,11 +24,14 @@ from agentnet.subjects import (
     REGISTRY_GOODBYE_SUBJECT,
     REGISTRY_HELLO_SUBJECT,
     REGISTRY_LIST_SUBJECT,
+    REGISTRY_MESSAGE_SEARCH_SUBJECT,
     REGISTRY_PROFILE_SUBJECT,
     REGISTRY_REGISTER_SUBJECT,
     REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
     REGISTRY_RESOLVE_KEY_SUBJECT,
     REGISTRY_SEARCH_SUBJECT,
+    REGISTRY_THREAD_LIST_SUBJECT,
+    REGISTRY_THREAD_MESSAGES_SUBJECT,
     REGISTRY_THREAD_STATUS_SUBJECT,
 )
 from agentnet.utils import decode_json, encode_json, new_ulid, utc_now_iso
@@ -90,6 +94,34 @@ def _classify_thread_status(approx_tokens: int, soft_limit_tokens: int, hard_lim
     if approx_tokens >= soft:
         return "warn"
     return "ok"
+
+
+def _encode_cursor(*, sent_at: datetime | str, message_id: str) -> str:
+    if isinstance(sent_at, datetime):
+        sent_at_value = _iso_utc(sent_at)
+    else:
+        sent_at_value = str(sent_at or "")
+    payload = {"sent_at": sent_at_value, "message_id": str(message_id or "")}
+    raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_cursor(cursor: str | None) -> tuple[datetime | None, str | None]:
+    normalized = str(cursor or "").strip()
+    if not normalized:
+        return None, None
+    try:
+        raw = base64.urlsafe_b64decode(normalized.encode("ascii"))
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:  # noqa: BLE001
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    sent_at = parse_iso_utc(str(data.get("sent_at") or ""))
+    message_id = str(data.get("message_id") or "").strip() or None
+    if sent_at is None or message_id is None:
+        return None, None
+    return sent_at, message_id
 
 
 class PostgresSessionStore:
@@ -190,6 +222,8 @@ class PostgresSessionStore:
                 to_account_id TEXT NULL,
                 to_agent TEXT NOT NULL,
                 kind TEXT NOT NULL,
+                schema_version TEXT NOT NULL DEFAULT '1.0',
+                idempotency_key TEXT NULL,
                 payload JSONB NOT NULL DEFAULT '{}'::jsonb,
                 trace_id TEXT NULL,
                 sent_at TIMESTAMPTZ NOT NULL,
@@ -199,10 +233,17 @@ class PostgresSessionStore:
             )
             """
         )
+        await self._pool.execute("ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS schema_version TEXT NOT NULL DEFAULT '1.0'")
+        await self._pool.execute("ALTER TABLE agent_messages ADD COLUMN IF NOT EXISTS idempotency_key TEXT NULL")
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_thread_id ON agent_messages(thread_id)")
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_sent_at ON agent_messages(sent_at)")
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_from_account ON agent_messages(from_account_id)")
         await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_to_account ON agent_messages(to_account_id)")
+        await self._pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_messages_thread_sent_msg ON agent_messages(thread_id, sent_at DESC, message_id DESC)"
+        )
+        await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_kind ON agent_messages(kind)")
+        await self._pool.execute("CREATE INDEX IF NOT EXISTS idx_agent_messages_idempotency_key ON agent_messages(idempotency_key)")
 
     async def resolve_or_create_account(
         self,
@@ -494,6 +535,190 @@ class PostgresSessionStore:
             "last_message_at": _iso_utc(row["last_message_at"]) if row["last_message_at"] is not None else None,
         }
 
+    async def list_threads(
+        self,
+        *,
+        participant_account_id: str | None,
+        query: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if self._pool is None:
+            raise RuntimeError("Postgres session store is not started")
+        safe_limit = max(1, min(int(limit), 100))
+        normalized_query = str(query or "").strip()
+        participant = str(participant_account_id or "").strip()
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                thread_id,
+                participants,
+                created_at,
+                updated_at,
+                message_count,
+                byte_count,
+                approx_tokens,
+                latest_checkpoint_end,
+                last_message_at
+            FROM agent_threads
+            WHERE
+                ($1 = '' OR thread_id ILIKE ('%' || $1 || '%'))
+                AND ($2 = '' OR participants ? $2)
+            ORDER BY COALESCE(last_message_at, updated_at) DESC, thread_id DESC
+            LIMIT $3
+            """,
+            normalized_query,
+            participant,
+            safe_limit,
+        )
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            participants = row["participants"] if isinstance(row["participants"], list) else []
+            results.append(
+                {
+                    "thread_id": str(row["thread_id"]),
+                    "participants": [str(item) for item in participants],
+                    "created_at": _iso_utc(row["created_at"]),
+                    "updated_at": _iso_utc(row["updated_at"]),
+                    "message_count": _coerce_non_negative_int(row["message_count"]),
+                    "byte_count": _coerce_non_negative_int(row["byte_count"]),
+                    "approx_tokens": _coerce_non_negative_int(row["approx_tokens"]),
+                    "latest_checkpoint_end": _coerce_non_negative_int(row["latest_checkpoint_end"]),
+                    "last_message_at": _iso_utc(row["last_message_at"]) if row["last_message_at"] is not None else None,
+                }
+            )
+        return results
+
+    @staticmethod
+    def _row_to_message(row: Any) -> dict[str, Any]:
+        payload = row["payload"] if isinstance(row["payload"], (dict, list, str, int, float, bool)) or row["payload"] is None else {}
+        metadata = row["metadata"] if isinstance(row["metadata"], dict) else {}
+        sent_at_value = row["sent_at"]
+        received_at_value = row["received_at"]
+        return {
+            "message_id": str(row["message_id"]),
+            "thread_id": str(row["thread_id"]),
+            "parent_message_id": str(row["parent_message_id"]) if row["parent_message_id"] is not None else None,
+            "from_account_id": str(row["from_account_id"]) if row["from_account_id"] is not None else None,
+            "from_session_tag": str(row["from_session_tag"]) if row["from_session_tag"] is not None else None,
+            "to_account_id": str(row["to_account_id"]) if row["to_account_id"] is not None else None,
+            "to_agent": str(row["to_agent"] or ""),
+            "kind": str(row["kind"] or ""),
+            "schema_version": str(row["schema_version"] or "1.0"),
+            "idempotency_key": str(row["idempotency_key"]) if row["idempotency_key"] is not None else None,
+            "payload": payload,
+            "trace_id": str(row["trace_id"]) if row["trace_id"] is not None else None,
+            "sent_at": _iso_utc(sent_at_value) if isinstance(sent_at_value, datetime) else str(sent_at_value or ""),
+            "received_at": _iso_utc(received_at_value) if isinstance(received_at_value, datetime) else str(received_at_value or ""),
+            "status": str(row["status"] or ""),
+            "metadata": metadata,
+        }
+
+    async def list_thread_messages(
+        self,
+        *,
+        thread_id: str,
+        limit: int,
+        cursor_sent_at: datetime | None,
+        cursor_message_id: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if self._pool is None:
+            raise RuntimeError("Postgres session store is not started")
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            return [], None
+        safe_limit = max(1, min(int(limit), 200))
+        fetch_limit = safe_limit + 1
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id,
+                to_agent, kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
+            FROM agent_messages
+            WHERE
+                thread_id = $1
+                AND (
+                    $2::timestamptz IS NULL
+                    OR sent_at < $2
+                    OR (sent_at = $2 AND message_id < $3)
+                )
+            ORDER BY sent_at DESC, message_id DESC
+            LIMIT $4
+            """,
+            normalized_thread_id,
+            cursor_sent_at,
+            cursor_message_id,
+            fetch_limit,
+        )
+        has_more = len(rows) > safe_limit
+        slice_rows = rows[:safe_limit]
+        messages = [self._row_to_message(row) for row in slice_rows]
+        next_cursor: str | None = None
+        if has_more and slice_rows:
+            last_row = slice_rows[-1]
+            next_cursor = _encode_cursor(sent_at=last_row["sent_at"], message_id=str(last_row["message_id"]))
+        return messages, next_cursor
+
+    async def search_messages(
+        self,
+        *,
+        thread_id: str | None,
+        from_account_id: str | None,
+        to_account_id: str | None,
+        kind: str | None,
+        from_ts: datetime | None,
+        to_ts: datetime | None,
+        limit: int,
+        cursor_sent_at: datetime | None,
+        cursor_message_id: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if self._pool is None:
+            raise RuntimeError("Postgres session store is not started")
+        safe_limit = max(1, min(int(limit), 200))
+        fetch_limit = safe_limit + 1
+        normalized_thread_id = str(thread_id or "").strip()
+        normalized_from_account_id = str(from_account_id or "").strip()
+        normalized_to_account_id = str(to_account_id or "").strip()
+        normalized_kind = str(kind or "").strip()
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id,
+                to_agent, kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
+            FROM agent_messages
+            WHERE
+                ($1 = '' OR thread_id = $1)
+                AND ($2 = '' OR from_account_id = $2)
+                AND ($3 = '' OR to_account_id = $3)
+                AND ($4 = '' OR kind = $4)
+                AND ($5::timestamptz IS NULL OR sent_at >= $5)
+                AND ($6::timestamptz IS NULL OR sent_at <= $6)
+                AND (
+                    $7::timestamptz IS NULL
+                    OR sent_at < $7
+                    OR (sent_at = $7 AND message_id < $8)
+                )
+            ORDER BY sent_at DESC, message_id DESC
+            LIMIT $9
+            """,
+            normalized_thread_id,
+            normalized_from_account_id,
+            normalized_to_account_id,
+            normalized_kind,
+            from_ts,
+            to_ts,
+            cursor_sent_at,
+            cursor_message_id,
+            fetch_limit,
+        )
+        has_more = len(rows) > safe_limit
+        slice_rows = rows[:safe_limit]
+        messages = [self._row_to_message(row) for row in slice_rows]
+        next_cursor: str | None = None
+        if has_more and slice_rows:
+            last_row = slice_rows[-1]
+            next_cursor = _encode_cursor(sent_at=last_row["sent_at"], message_id=str(last_row["message_id"]))
+        return messages, next_cursor
+
     async def persist_message(self, message: AgentMessage, received_at: datetime) -> None:
         if self._pool is None:
             return
@@ -544,9 +769,9 @@ class PostgresSessionStore:
                 """
                 INSERT INTO agent_messages (
                     message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id, to_agent,
-                    kind, payload, trace_id, sent_at, received_at, status, metadata
+                    kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, 'received', $13::jsonb)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, 'received', $15::jsonb)
                 ON CONFLICT (message_id) DO NOTHING
                 """,
                 message_id,
@@ -557,6 +782,8 @@ class PostgresSessionStore:
                 message.to_account_id,
                 message.to_agent,
                 message.kind,
+                str(message.schema_version or "1.0"),
+                str(message.idempotency_key or "") or None,
                 payload_json,
                 message.trace_id,
                 sent_at,
@@ -767,6 +994,9 @@ class RegistryService:
         await self._nc.subscribe(REGISTRY_SEARCH_SUBJECT, cb=self._on_search)
         await self._nc.subscribe(REGISTRY_PROFILE_SUBJECT, cb=self._on_profile)
         await self._nc.subscribe(REGISTRY_THREAD_STATUS_SUBJECT, cb=self._on_thread_status)
+        await self._nc.subscribe(REGISTRY_THREAD_LIST_SUBJECT, cb=self._on_thread_list)
+        await self._nc.subscribe(REGISTRY_THREAD_MESSAGES_SUBJECT, cb=self._on_thread_messages)
+        await self._nc.subscribe(REGISTRY_MESSAGE_SEARCH_SUBJECT, cb=self._on_message_search)
         await self._nc.subscribe("account.*.inbox", cb=self._on_account_message)
         await self._nc.subscribe("agent.capability.*", cb=self._on_account_message)
         await self._nc.subscribe("_INBOX.>", cb=self._on_account_message)
@@ -1107,6 +1337,195 @@ class RegistryService:
         }
         await self._nc.publish(msg.reply, encode_json(response))
 
+    async def _on_thread_list(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        data = decode_json(msg.data)
+        if not isinstance(data, dict):
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_list payload must be an object"}))
+            return
+
+        query = str(data.get("query") or "")
+        try:
+            limit = int(data.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        safe_limit = max(1, min(limit, 100))
+
+        participant_account_id = str(data.get("participant_account_id") or "").strip() or None
+        participant_username_raw = str(data.get("participant_username") or "")
+        participant_username = normalize_username(participant_username_raw) if participant_username_raw else None
+        if participant_username and not participant_account_id:
+            try:
+                resolved = await self._resolve_account_by_username(participant_username)
+            except Exception:  # noqa: BLE001
+                self.logger.exception("Failed resolving participant_username during thread_list")
+                await self._nc.publish(msg.reply, encode_json({"error": "thread_list_failed"}))
+                return
+            if resolved is None:
+                response = {
+                    "query": query,
+                    "limit": safe_limit,
+                    "participant_account_id": None,
+                    "participant_username": participant_username,
+                    "results": [],
+                    "generated_at": utc_now_iso(),
+                }
+                await self._nc.publish(msg.reply, encode_json(response))
+                return
+            participant_account_id = resolved[0]
+
+        soft_limit_tokens = _coerce_non_negative_int(
+            data.get("soft_limit_tokens"),
+            default=self.thread_soft_limit_tokens,
+        )
+        hard_limit_tokens = _coerce_non_negative_int(
+            data.get("hard_limit_tokens"),
+            default=self.thread_hard_limit_tokens,
+        )
+        soft_limit_tokens = max(1, soft_limit_tokens)
+        hard_limit_tokens = max(soft_limit_tokens, hard_limit_tokens)
+
+        try:
+            threads = await self._list_threads(
+                participant_account_id=participant_account_id,
+                query=query,
+                limit=safe_limit,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed thread list lookup")
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_list_failed"}))
+            return
+
+        results: list[dict[str, Any]] = []
+        for item in threads:
+            approx_tokens = _coerce_non_negative_int(item.get("approx_tokens"))
+            status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
+            results.append(
+                {
+                    **item,
+                    "status": status,
+                }
+            )
+
+        response = {
+            "query": query,
+            "limit": safe_limit,
+            "participant_account_id": participant_account_id,
+            "participant_username": participant_username,
+            "soft_limit_tokens": soft_limit_tokens,
+            "hard_limit_tokens": hard_limit_tokens,
+            "token_estimate_chars_per_token": self.token_estimate_chars_per_token,
+            "results": results,
+            "generated_at": utc_now_iso(),
+        }
+        await self._nc.publish(msg.reply, encode_json(response))
+
+    async def _on_thread_messages(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        data = decode_json(msg.data)
+        if not isinstance(data, dict):
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_messages payload must be an object"}))
+            return
+        thread_id = str(data.get("thread_id") or "").strip()
+        if not thread_id:
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_id is required"}))
+            return
+        try:
+            limit = int(data.get("limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        safe_limit = max(1, min(limit, 200))
+        cursor_sent_at, cursor_message_id = _decode_cursor(str(data.get("cursor") or ""))
+        try:
+            messages, next_cursor = await self._list_thread_messages(
+                thread_id=thread_id,
+                limit=safe_limit,
+                cursor_sent_at=cursor_sent_at,
+                cursor_message_id=cursor_message_id,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed thread message lookup thread_id=%s", thread_id)
+            await self._nc.publish(msg.reply, encode_json({"error": "thread_messages_failed"}))
+            return
+        await self._nc.publish(
+            msg.reply,
+            encode_json(
+                {
+                    "thread_id": thread_id,
+                    "limit": safe_limit,
+                    "cursor": str(data.get("cursor") or "") or None,
+                    "next_cursor": next_cursor,
+                    "messages": messages,
+                    "generated_at": utc_now_iso(),
+                }
+            ),
+        )
+
+    async def _on_message_search(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        data = decode_json(msg.data)
+        if not isinstance(data, dict):
+            await self._nc.publish(msg.reply, encode_json({"error": "message_search payload must be an object"}))
+            return
+
+        thread_id = str(data.get("thread_id") or "").strip() or None
+        from_account_id = str(data.get("from_account_id") or "").strip() or None
+        to_account_id = str(data.get("to_account_id") or "").strip() or None
+        kind = str(data.get("kind") or "").strip() or None
+        from_ts = parse_iso_utc(str(data.get("from_ts") or "")) if data.get("from_ts") else None
+        to_ts = parse_iso_utc(str(data.get("to_ts") or "")) if data.get("to_ts") else None
+        if data.get("from_ts") and from_ts is None:
+            await self._nc.publish(msg.reply, encode_json({"error": "from_ts_invalid"}))
+            return
+        if data.get("to_ts") and to_ts is None:
+            await self._nc.publish(msg.reply, encode_json({"error": "to_ts_invalid"}))
+            return
+        try:
+            limit = int(data.get("limit") or 50)
+        except (TypeError, ValueError):
+            limit = 50
+        safe_limit = max(1, min(limit, 200))
+        cursor_sent_at, cursor_message_id = _decode_cursor(str(data.get("cursor") or ""))
+        try:
+            messages, next_cursor = await self._search_messages(
+                thread_id=thread_id,
+                from_account_id=from_account_id,
+                to_account_id=to_account_id,
+                kind=kind,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=safe_limit,
+                cursor_sent_at=cursor_sent_at,
+                cursor_message_id=cursor_message_id,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed message search")
+            await self._nc.publish(msg.reply, encode_json({"error": "message_search_failed"}))
+            return
+        await self._nc.publish(
+            msg.reply,
+            encode_json(
+                {
+                    "filters": {
+                        "thread_id": thread_id,
+                        "from_account_id": from_account_id,
+                        "to_account_id": to_account_id,
+                        "kind": kind,
+                        "from_ts": str(data.get("from_ts") or "") or None,
+                        "to_ts": str(data.get("to_ts") or "") or None,
+                    },
+                    "limit": safe_limit,
+                    "cursor": str(data.get("cursor") or "") or None,
+                    "next_cursor": next_cursor,
+                    "messages": messages,
+                    "generated_at": utc_now_iso(),
+                }
+            ),
+        )
+
     async def _on_account_message(self, msg: Msg) -> None:
         try:
             data = decode_json(msg.data)
@@ -1379,6 +1798,217 @@ class RegistryService:
             "last_message_at": str(thread.get("last_message_at") or "") or None,
         }
 
+    async def _list_threads(
+        self,
+        *,
+        participant_account_id: str | None,
+        query: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if self._store is not None:
+            return await self._store.list_threads(
+                participant_account_id=participant_account_id,
+                query=query,
+                limit=limit,
+            )
+        normalized_query = str(query or "").strip().lower()
+        participant = str(participant_account_id or "").strip()
+        safe_limit = max(1, min(limit, 100))
+        rows: list[dict[str, Any]] = []
+        for thread_id, thread in self._local_threads.items():
+            if normalized_query and normalized_query not in thread_id.lower():
+                continue
+            participants = thread.get("participants") if isinstance(thread.get("participants"), list) else []
+            participant_values = [str(item) for item in participants if str(item).strip()]
+            if participant and participant not in participant_values:
+                continue
+            rows.append(
+                {
+                    "thread_id": thread_id,
+                    "participants": participant_values,
+                    "created_at": str(thread.get("created_at") or ""),
+                    "updated_at": str(thread.get("updated_at") or ""),
+                    "message_count": _coerce_non_negative_int(thread.get("message_count")),
+                    "byte_count": _coerce_non_negative_int(thread.get("byte_count")),
+                    "approx_tokens": _coerce_non_negative_int(thread.get("approx_tokens")),
+                    "latest_checkpoint_end": _coerce_non_negative_int(thread.get("latest_checkpoint_end")),
+                    "last_message_at": str(thread.get("last_message_at") or "") or None,
+                }
+            )
+        rows.sort(
+            key=lambda item: (
+                str(item.get("last_message_at") or item.get("updated_at") or ""),
+                str(item.get("thread_id") or ""),
+            ),
+            reverse=True,
+        )
+        return rows[:safe_limit]
+
+    async def _list_thread_messages(
+        self,
+        *,
+        thread_id: str,
+        limit: int,
+        cursor_sent_at: datetime | None,
+        cursor_message_id: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if self._store is not None:
+            return await self._store.list_thread_messages(
+                thread_id=thread_id,
+                limit=limit,
+                cursor_sent_at=cursor_sent_at,
+                cursor_message_id=cursor_message_id,
+            )
+        normalized_thread_id = str(thread_id or "").strip()
+        safe_limit = max(1, min(limit, 200))
+        rows: list[dict[str, Any]] = []
+        for message in self._local_messages.values():
+            if str(message.get("thread_id") or "") != normalized_thread_id:
+                continue
+            sent_at_raw = str(message.get("sent_at") or "")
+            sent_at_dt = parse_iso_utc(sent_at_raw)
+            if cursor_sent_at is not None:
+                if sent_at_dt is None:
+                    continue
+                message_id = str(message.get("message_id") or "")
+                if not (sent_at_dt < cursor_sent_at or (sent_at_dt == cursor_sent_at and message_id < (cursor_message_id or ""))):
+                    continue
+            rows.append(message)
+        rows.sort(
+            key=lambda item: (
+                str(item.get("sent_at") or ""),
+                str(item.get("message_id") or ""),
+            ),
+            reverse=True,
+        )
+        selected = rows[: safe_limit + 1]
+        has_more = len(selected) > safe_limit
+        slice_rows = selected[:safe_limit]
+        messages = [
+            {
+                "message_id": str(item.get("message_id") or ""),
+                "thread_id": str(item.get("thread_id") or ""),
+                "parent_message_id": str(item.get("parent_message_id")) if item.get("parent_message_id") else None,
+                "from_account_id": str(item.get("from_account_id")) if item.get("from_account_id") else None,
+                "from_session_tag": str(item.get("from_session_tag")) if item.get("from_session_tag") else None,
+                "to_account_id": str(item.get("to_account_id")) if item.get("to_account_id") else None,
+                "to_agent": str(item.get("to_agent") or ""),
+                "kind": str(item.get("kind") or ""),
+                "schema_version": str(item.get("schema_version") or "1.0"),
+                "idempotency_key": str(item.get("idempotency_key")) if item.get("idempotency_key") else None,
+                "payload": item.get("payload"),
+                "trace_id": str(item.get("trace_id")) if item.get("trace_id") else None,
+                "sent_at": str(item.get("sent_at") or ""),
+                "received_at": str(item.get("received_at") or ""),
+                "status": "received",
+                "metadata": {},
+            }
+            for item in slice_rows
+        ]
+        next_cursor: str | None = None
+        if has_more and slice_rows:
+            last_item = slice_rows[-1]
+            next_cursor = _encode_cursor(
+                sent_at=str(last_item.get("sent_at") or ""),
+                message_id=str(last_item.get("message_id") or ""),
+            )
+        return messages, next_cursor
+
+    async def _search_messages(
+        self,
+        *,
+        thread_id: str | None,
+        from_account_id: str | None,
+        to_account_id: str | None,
+        kind: str | None,
+        from_ts: datetime | None,
+        to_ts: datetime | None,
+        limit: int,
+        cursor_sent_at: datetime | None,
+        cursor_message_id: str | None,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        if self._store is not None:
+            return await self._store.search_messages(
+                thread_id=thread_id,
+                from_account_id=from_account_id,
+                to_account_id=to_account_id,
+                kind=kind,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                cursor_sent_at=cursor_sent_at,
+                cursor_message_id=cursor_message_id,
+            )
+        normalized_thread_id = str(thread_id or "").strip()
+        normalized_from = str(from_account_id or "").strip()
+        normalized_to = str(to_account_id or "").strip()
+        normalized_kind = str(kind or "").strip()
+        safe_limit = max(1, min(limit, 200))
+        rows: list[dict[str, Any]] = []
+        for message in self._local_messages.values():
+            if normalized_thread_id and str(message.get("thread_id") or "") != normalized_thread_id:
+                continue
+            if normalized_from and str(message.get("from_account_id") or "") != normalized_from:
+                continue
+            if normalized_to and str(message.get("to_account_id") or "") != normalized_to:
+                continue
+            if normalized_kind and str(message.get("kind") or "") != normalized_kind:
+                continue
+            sent_at_raw = str(message.get("sent_at") or "")
+            sent_at_dt = parse_iso_utc(sent_at_raw)
+            if from_ts is not None:
+                if sent_at_dt is None or sent_at_dt < from_ts:
+                    continue
+            if to_ts is not None:
+                if sent_at_dt is None or sent_at_dt > to_ts:
+                    continue
+            if cursor_sent_at is not None:
+                if sent_at_dt is None:
+                    continue
+                message_id = str(message.get("message_id") or "")
+                if not (sent_at_dt < cursor_sent_at or (sent_at_dt == cursor_sent_at and message_id < (cursor_message_id or ""))):
+                    continue
+            rows.append(message)
+        rows.sort(
+            key=lambda item: (
+                str(item.get("sent_at") or ""),
+                str(item.get("message_id") or ""),
+            ),
+            reverse=True,
+        )
+        selected = rows[: safe_limit + 1]
+        has_more = len(selected) > safe_limit
+        slice_rows = selected[:safe_limit]
+        messages = [
+            {
+                "message_id": str(item.get("message_id") or ""),
+                "thread_id": str(item.get("thread_id") or ""),
+                "parent_message_id": str(item.get("parent_message_id")) if item.get("parent_message_id") else None,
+                "from_account_id": str(item.get("from_account_id")) if item.get("from_account_id") else None,
+                "from_session_tag": str(item.get("from_session_tag")) if item.get("from_session_tag") else None,
+                "to_account_id": str(item.get("to_account_id")) if item.get("to_account_id") else None,
+                "to_agent": str(item.get("to_agent") or ""),
+                "kind": str(item.get("kind") or ""),
+                "schema_version": str(item.get("schema_version") or "1.0"),
+                "idempotency_key": str(item.get("idempotency_key")) if item.get("idempotency_key") else None,
+                "payload": item.get("payload"),
+                "trace_id": str(item.get("trace_id")) if item.get("trace_id") else None,
+                "sent_at": str(item.get("sent_at") or ""),
+                "received_at": str(item.get("received_at") or ""),
+                "status": "received",
+                "metadata": {},
+            }
+            for item in slice_rows
+        ]
+        next_cursor: str | None = None
+        if has_more and slice_rows:
+            last_item = slice_rows[-1]
+            next_cursor = _encode_cursor(
+                sent_at=str(last_item.get("sent_at") or ""),
+                message_id=str(last_item.get("message_id") or ""),
+            )
+        return messages, next_cursor
+
     def _persist_message_local(self, message: AgentMessage) -> None:
         thread_id = str(message.thread_id or "").strip() or f"thread_{(message.trace_id or message.message_id).lower()}"
         is_new_message = message.message_id not in self._local_messages
@@ -1443,6 +2073,8 @@ class RegistryService:
             "payload": message.payload,
             "trace_id": message.trace_id,
             "kind": message.kind,
+            "schema_version": message.schema_version,
+            "idempotency_key": message.idempotency_key,
             "sent_at": message.sent_at,
             "received_at": now_iso,
             "byte_count": payload_bytes,

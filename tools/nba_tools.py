@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional
 import json
 import logging
+import os
 import threading
 import time
 import concurrent.futures
@@ -24,6 +25,24 @@ _ET = timezone(timedelta(hours=-5))
 
 # Persistent disk cache (thread-safe, survives restarts)
 _CACHE = diskcache.Cache("logs/cache")
+
+
+def _odds_enabled() -> bool:
+    raw = str(os.getenv("ODDS_ENABLED", "true")).strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _disabled_market_snapshot(home_team: str, away_team: str, regions: str, markets: str) -> Dict[str, Any]:
+    return {
+        "disabled": True,
+        "source": "disabled_by_env",
+        "reason": "ODDS_ENABLED=false",
+        "home_team": home_team,
+        "away_team": away_team,
+        "regions": regions,
+        "requested_markets": markets,
+        "market_lines": {"available": False},
+    }
 
 def _get_today() -> str:
     return datetime.now(_ET).strftime("%Y-%m-%d")
@@ -379,6 +398,8 @@ def _normalize_market_lines(event: Dict[str, Any], home_team: str, away_team: st
 
 
 def _market_snapshot(home_team: str, away_team: str, regions: str, markets: str) -> Dict[str, Any]:
+    if not _odds_enabled():
+        return _disabled_market_snapshot(home_team, away_team, regions, markets)
     odds_data = odds_client.get_odds(
         sport="basketball_nba",
         regions=regions,
@@ -1130,6 +1151,23 @@ def get_market_odds(
         commence_time_to (str, optional): ISO timestamp upper bound.
         include_links/include_sids/include_bet_limits/include_rotation_numbers (bool, optional): API flags.
     """
+    if not _odds_enabled():
+        return json.dumps(
+            {
+                "disabled": True,
+                "source": "disabled_by_env",
+                "reason": "ODDS_ENABLED=false",
+                "data": [],
+                "meta": {
+                    "sport": sport,
+                    "regions": regions,
+                    "markets": markets,
+                    "team_filter": team_name,
+                    "events_returned": 0,
+                },
+            }
+        )
+
     cache_key = _cache_key(
         "get_market_odds",
         {

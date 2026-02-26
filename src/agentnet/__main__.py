@@ -12,15 +12,21 @@ from rich.console import Console
 from rich.json import JSON as RichJSON
 from rich.live import Live
 from rich.markup import escape
-from rich.panel import Panel
-from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
-from agentnet.registry import get_profile, get_thread_status, list_online_agents, search_profiles
+from agentnet.registry import (
+    get_profile,
+    get_thread_messages,
+    get_thread_status,
+    list_online_agents,
+    list_threads,
+    search_messages,
+    search_profiles,
+)
 from agentnet.utils import decode_json, new_ulid
 
 # ──────────────────────────────────────────────
@@ -29,21 +35,21 @@ from agentnet.utils import decode_json, new_ulid
 
 _THEME = Theme(
     {
-        "agent.name": "bold cyan",
+        "agent.name": "bold bright_cyan",
         "agent.id": "dim",
-        "agent.online": "bold green",
-        "agent.cap": "magenta",
-        "agent.meta": "dim yellow",
+        "agent.online": "bold bright_green",
+        "agent.cap": "bright_blue",
+        "agent.meta": "dim bright_yellow",
         "msg.you": "bold white",
-        "msg.agent": "bold cyan",
+        "msg.agent": "bold bright_cyan",
         "msg.system": "dim italic",
-        "msg.error": "bold red",
-        "field.label": "bold white",
+        "msg.error": "bold bright_red",
+        "field.label": "bold bright_white",
         "field.value": "white",
-        "success": "bold green",
-        "warn": "bold yellow",
-        "info": "bold blue",
-        "accent": "bold magenta",
+        "success": "bold bright_green",
+        "warn": "bold bright_yellow",
+        "info": "bold bright_blue",
+        "accent": "bold bright_cyan",
     }
 )
 
@@ -56,15 +62,7 @@ BANNER = Text.from_markup(
 
 
 def _print_error(message: str) -> None:
-    err_console.print(
-        Panel(
-            Text(message, style="msg.error"),
-            border_style="red",
-            title="[bold red]Error[/]",
-            title_align="left",
-            padding=(0, 1),
-        )
-    )
+    err_console.print(f"[msg.error]error:[/] {message}")
 
 
 def _capability_tags(caps: list[str]) -> Text:
@@ -98,6 +96,22 @@ def _time_ago(iso_str: str | None) -> str:
         return iso_str or "—"
 
 
+def _payload_preview(payload: object, max_chars: int = 72) -> str:
+    if isinstance(payload, dict):
+        text_value = payload.get("text")
+        if isinstance(text_value, str) and text_value.strip():
+            preview = text_value.strip()
+        else:
+            preview = json.dumps(payload, separators=(",", ":"))
+    elif isinstance(payload, str):
+        preview = payload.strip()
+    else:
+        preview = json.dumps(payload, separators=(",", ":"))
+    if len(preview) <= max_chars:
+        return preview
+    return preview[: max_chars - 1] + "…"
+
+
 # ──────────────────────────────────────────────
 # list
 # ──────────────────────────────────────────────
@@ -107,15 +121,7 @@ async def _run_list(nats_url: str, timeout: float) -> int:
         agents = await list_online_agents(nats_url=nats_url, timeout=timeout)
 
     if not agents:
-        console.print(
-            Panel(
-                "[dim]No agents currently online[/]",
-                border_style="dim",
-                title="[info]Online Agents[/]",
-                title_align="left",
-                padding=(0, 1),
-            )
-        )
+        console.print("[dim]No agents currently online[/]")
         return 0
 
     table = Table(
@@ -265,20 +271,80 @@ async def _run_profile(
             lines.append(f"  {key}: ", style="dim yellow")
             lines.append(f"{value}\n", style="field.value")
 
-    panel = Panel(
-        lines,
-        title=f"[agent.name]{escape(display_name)}[/]",
-        title_align="left",
-        border_style="cyan",
-        padding=(1, 2),
-    )
-    console.print(panel)
+    console.print(f"[agent.name]{escape(display_name)}[/]")
+    console.print(lines)
     return 0
 
 
 # ──────────────────────────────────────────────
-# thread-status
+# thread-list / thread-status
 # ──────────────────────────────────────────────
+
+async def _run_thread_list(
+    nats_url: str,
+    participant_account: str | None,
+    participant_username: str | None,
+    query: str,
+    limit: int,
+    soft_limit_tokens: int | None,
+    hard_limit_tokens: int | None,
+    timeout: float,
+) -> int:
+    with console.status("[info]Fetching thread list…[/]", spinner="dots"):
+        rows = await list_threads(
+            nats_url,
+            participant_account_id=participant_account,
+            participant_username=participant_username,
+            query=query,
+            limit=limit,
+            soft_limit_tokens=soft_limit_tokens,
+            hard_limit_tokens=hard_limit_tokens,
+            timeout=timeout,
+        )
+
+    if not rows:
+        console.print("[dim]No matching threads found[/]")
+        return 0
+
+    table = Table(
+        title=f"[info]Threads[/]  [dim]({len(rows)})[/]",
+        border_style="bright_black",
+        title_justify="left",
+        show_edge=True,
+        expand=True,
+    )
+    table.add_column("Thread ID", style="field.value", no_wrap=True)
+    table.add_column("Status", justify="center")
+    table.add_column("Messages", justify="right", style="field.value")
+    table.add_column("Tokens~", justify="right", style="field.value")
+    table.add_column("Last Activity", style="dim", justify="right")
+    table.add_column("Participants", style="dim")
+
+    for row in rows:
+        state = str(row.get("status") or "unknown")
+        if state == "ok":
+            state_text = Text("ok", style="success")
+        elif state == "warn":
+            state_text = Text("warn", style="warn")
+        else:
+            state_text = Text(state, style="msg.error")
+        thread_value = str(row.get("thread_id") or "—")
+        participants = row.get("participants")
+        if isinstance(participants, list):
+            participant_text = ", ".join(str(item) for item in participants if str(item).strip()) or "—"
+        else:
+            participant_text = "—"
+        table.add_row(
+            thread_value,
+            state_text,
+            str(row.get("message_count", 0)),
+            str(row.get("approx_tokens", 0)),
+            _time_ago(row.get("last_message_at")),
+            participant_text,
+        )
+
+    console.print(table)
+    return 0
 
 async def _run_thread_status(
     nats_url: str,
@@ -299,42 +365,127 @@ async def _run_thread_status(
     state = str(status.get("status") or "unknown")
     state_style = "success" if state == "ok" else "warn" if state == "warn" else "msg.error"
 
-    lines = Text()
-    lines.append("Thread      ", style="field.label")
-    lines.append(f"{status.get('thread_id', thread_id)}\n", style="field.value")
-    lines.append("Status      ", style="field.label")
-    lines.append(f"{state}\n", style=state_style)
-    lines.append("Messages    ", style="field.label")
-    lines.append(f"{status.get('message_count', 0)}\n", style="field.value")
-    lines.append("Bytes       ", style="field.label")
-    lines.append(f"{status.get('byte_count', 0)}\n", style="field.value")
-    lines.append("Tokens~     ", style="field.label")
-    lines.append(f"{status.get('approx_tokens', 0)}\n", style="field.value")
-    lines.append("Soft/Hard   ", style="field.label")
-    lines.append(
-        f"{status.get('soft_limit_tokens', '—')} / {status.get('hard_limit_tokens', '—')}\n",
-        style="field.value",
-    )
-    lines.append("Checkpoint  ", style="field.label")
-    lines.append(f"{status.get('latest_checkpoint_end', 0)}\n", style="field.value")
-    lines.append("Last Msg At ", style="field.label")
-    lines.append(f"{status.get('last_message_at') or '—'}\n", style="dim")
-
+    table = Table(border_style="bright_black", show_header=False, show_edge=True, expand=False)
+    table.add_column("k", style="field.label", no_wrap=True)
+    table.add_column("v", style="field.value")
+    table.add_row("Thread", str(status.get("thread_id", thread_id)))
+    table.add_row("Status", Text(state, style=state_style))
+    table.add_row("Messages", str(status.get("message_count", 0)))
+    table.add_row("Bytes", str(status.get("byte_count", 0)))
+    table.add_row("Tokens~", str(status.get("approx_tokens", 0)))
+    table.add_row("Soft/Hard", f"{status.get('soft_limit_tokens', '—')} / {status.get('hard_limit_tokens', '—')}")
+    table.add_row("Checkpoint", str(status.get("latest_checkpoint_end", 0)))
+    table.add_row("Last Msg At", str(status.get("last_message_at") or "—"))
     participants = status.get("participants")
     if isinstance(participants, list) and participants:
-        lines.append("Participants ", style="field.label")
-        lines.append(", ".join(str(item) for item in participants), style="field.value")
-        lines.append("\n")
+        table.add_row("Participants", ", ".join(str(item) for item in participants))
+    console.print(table)
+    return 0
 
-    console.print(
-        Panel(
-            lines,
-            title="[info]Thread Status[/]",
-            title_align="left",
-            border_style="cyan",
-            padding=(1, 2),
+
+async def _run_thread_messages(
+    nats_url: str,
+    thread_id: str,
+    limit: int,
+    cursor: str | None,
+    timeout: float,
+) -> int:
+    with console.status("[info]Fetching thread messages…[/]", spinner="dots"):
+        result = await get_thread_messages(
+            nats_url,
+            thread_id=thread_id,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
         )
+    rows = result.get("messages")
+    if not isinstance(rows, list) or not rows:
+        console.print("[dim]No messages found[/]")
+        return 0
+    table = Table(
+        title=f"[info]Thread Messages[/] [dim]{escape(thread_id)}[/]  [dim]({len(rows)})[/]",
+        border_style="bright_black",
+        title_justify="left",
+        show_edge=True,
+        expand=True,
     )
+    table.add_column("Sent", style="dim", no_wrap=True)
+    table.add_column("Kind", style="field.value", no_wrap=True)
+    table.add_column("From", style="field.value", no_wrap=True)
+    table.add_column("To", style="field.value", no_wrap=True)
+    table.add_column("Message", style="field.value")
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        sent_at = str(item.get("sent_at") or "—")
+        kind = str(item.get("kind") or "—")
+        sender = str(item.get("from_account_id") or "—")
+        target = str(item.get("to_account_id") or item.get("to_agent") or "—")
+        preview = _payload_preview(item.get("payload"))
+        table.add_row(sent_at, kind, sender, target, preview)
+    console.print(table)
+    next_cursor = str(result.get("next_cursor") or "").strip()
+    if next_cursor:
+        console.print(f"[dim]next_cursor=[/][accent]{next_cursor}[/]")
+    return 0
+
+
+async def _run_message_search(
+    nats_url: str,
+    thread_id: str | None,
+    from_account_id: str | None,
+    to_account_id: str | None,
+    kind: str | None,
+    from_ts: str | None,
+    to_ts: str | None,
+    limit: int,
+    cursor: str | None,
+    timeout: float,
+) -> int:
+    with console.status("[info]Searching messages…[/]", spinner="dots"):
+        result = await search_messages(
+            nats_url,
+            thread_id=thread_id,
+            from_account_id=from_account_id,
+            to_account_id=to_account_id,
+            kind=kind,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            limit=limit,
+            cursor=cursor,
+            timeout=timeout,
+        )
+    rows = result.get("messages")
+    if not isinstance(rows, list) or not rows:
+        console.print("[dim]No matching messages found[/]")
+        return 0
+    table = Table(
+        title=f"[info]Message Search[/]  [dim]({len(rows)})[/]",
+        border_style="bright_black",
+        title_justify="left",
+        show_edge=True,
+        expand=True,
+    )
+    table.add_column("Sent", style="dim", no_wrap=True)
+    table.add_column("Thread", style="field.value", no_wrap=True)
+    table.add_column("Kind", style="field.value", no_wrap=True)
+    table.add_column("From", style="field.value", no_wrap=True)
+    table.add_column("To", style="field.value", no_wrap=True)
+    table.add_column("Message", style="field.value")
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        sent_at = str(item.get("sent_at") or "—")
+        thread_value = str(item.get("thread_id") or "—")
+        kind_value = str(item.get("kind") or "—")
+        sender = str(item.get("from_account_id") or "—")
+        target = str(item.get("to_account_id") or item.get("to_agent") or "—")
+        preview = _payload_preview(item.get("payload"))
+        table.add_row(sent_at, thread_value, kind_value, sender, target, preview)
+    console.print(table)
+    next_cursor = str(result.get("next_cursor") or "").strip()
+    if next_cursor:
+        console.print(f"[dim]next_cursor=[/][accent]{next_cursor}[/]")
     return 0
 
 
@@ -350,6 +501,7 @@ async def _run_send(
     payload: str,
     thread_id: str | None,
     parent_message_id: str | None,
+    idempotency_key: str | None,
     retry_attempts: int,
     receipt_timeout: float,
     no_ack: bool,
@@ -369,6 +521,7 @@ async def _run_send(
                     data,
                     thread_id=thread_id,
                     parent_message_id=parent_message_id,
+                    idempotency_key=idempotency_key,
                     require_delivery_ack=not no_ack,
                     retry_attempts=retry_attempts,
                     receipt_timeout=receipt_timeout,
@@ -379,6 +532,7 @@ async def _run_send(
                     data,
                     thread_id=thread_id,
                     parent_message_id=parent_message_id,
+                    idempotency_key=idempotency_key,
                     require_delivery_ack=not no_ack,
                     retry_attempts=retry_attempts,
                     receipt_timeout=receipt_timeout,
@@ -389,6 +543,7 @@ async def _run_send(
                     data,
                     thread_id=thread_id,
                     parent_message_id=parent_message_id,
+                    idempotency_key=idempotency_key,
                     require_delivery_ack=not no_ack,
                     retry_attempts=retry_attempts,
                     receipt_timeout=receipt_timeout,
@@ -416,6 +571,7 @@ async def _run_request(
     timeout: float,
     thread_id: str | None,
     parent_message_id: str | None,
+    idempotency_key: str | None,
 ) -> int:
     try:
         data = json.loads(payload)
@@ -434,6 +590,7 @@ async def _run_request(
                         timeout=timeout,
                         thread_id=thread_id,
                         parent_message_id=parent_message_id,
+                        idempotency_key=idempotency_key,
                     )
                 elif to_account:
                     reply = await node.request_account(
@@ -442,6 +599,7 @@ async def _run_request(
                         timeout=timeout,
                         thread_id=thread_id,
                         parent_message_id=parent_message_id,
+                        idempotency_key=idempotency_key,
                     )
                 elif to_username:
                     reply = await node.request_username(
@@ -450,6 +608,7 @@ async def _run_request(
                         timeout=timeout,
                         thread_id=thread_id,
                         parent_message_id=parent_message_id,
+                        idempotency_key=idempotency_key,
                     )
                 else:
                     _print_error("One destination option is required")
@@ -459,15 +618,8 @@ async def _run_request(
                 return 1
 
     reply_json = json.dumps(reply.to_dict(), indent=2)
-    console.print(
-        Panel(
-            RichJSON(reply_json),
-            title=f"[success]Reply[/] [dim]from {escape(dest)}[/]",
-            title_align="left",
-            border_style="green",
-            padding=(0, 1),
-        )
-    )
+    console.print(f"[success]reply[/] [dim]from {escape(dest)}[/]")
+    console.print(RichJSON(reply_json))
     return 0
 
 
@@ -489,7 +641,7 @@ async def _run_watch(
     done = asyncio.Event()
     count = 0
 
-    console.print(Rule(f"[info]Watching[/]  [accent]{escape(subject)}[/]"))
+    console.print(f"[info]Watching[/] [accent]{escape(subject)}[/]")
     if remaining is None:
         console.print("[dim]Press Ctrl+C to stop[/]\n")
 
@@ -530,13 +682,7 @@ async def _run_watch(
             if include_payload:
                 p = payload.get("payload")
                 if p:
-                    console.print(
-                        Panel(
-                            RichJSON(json.dumps(p, indent=2)),
-                            border_style="dim",
-                            padding=(0, 1),
-                        )
-                    )
+                    console.print(RichJSON(json.dumps(p, indent=2)))
         else:
             line = Text()
             line.append(f"#{count:<4} ", style="dim")
@@ -562,7 +708,7 @@ async def _run_watch(
         if nc.is_connected:
             await nc.drain()
 
-    console.print(Rule("[dim]stream ended[/]"))
+    console.print("[dim]stream ended[/]")
     return 0
 
 
@@ -583,21 +729,8 @@ async def _run_chat(
     current_thread = thread_id or f"thread_cli_{new_ulid().lower()}"
     dest = to_username and f"@{to_username}" or to_account or to_capability or "?"
 
-    console.print()
-    console.print(
-        Panel(
-            Text.from_markup(
-                f"[agent.name]{escape(dest)}[/]\n"
-                f"[dim]thread [/][dim italic]{current_thread}[/]\n\n"
-                f"[dim]/quit  /thread <id>  /showthread[/]"
-            ),
-            title="[info]Chat Session[/]",
-            title_align="left",
-            border_style="cyan",
-            padding=(0, 2),
-        )
-    )
-    console.print()
+    console.print(f"[agent.name]{escape(dest)}[/] [dim]thread={current_thread}[/]")
+    console.print("[dim]/quit  /thread <id>  /showthread[/]\n")
 
     async with AgentNode(agent_id="cli_chat", name="CLI Chat", nats_url=nats_url) as node:
         while True:
@@ -661,25 +794,11 @@ async def _run_chat(
 
             if raw:
                 reply_json = json.dumps(reply.to_dict(), indent=2)
-                console.print(
-                    Panel(
-                        RichJSON(reply_json),
-                        border_style="cyan",
-                        padding=(0, 1),
-                    )
-                )
+                console.print(RichJSON(reply_json))
             else:
                 out = reply.payload if isinstance(reply.payload, dict) else {"text": str(reply.payload)}
                 text_out = str(out.get("text") or out.get("error") or "").strip() or json.dumps(out)
-                console.print(
-                    Panel(
-                        Text(text_out, style="field.value"),
-                        title=f"[msg.agent]{escape(dest)}[/]",
-                        title_align="left",
-                        border_style="cyan",
-                        padding=(0, 2),
-                    )
-                )
+                console.print(f"[msg.agent]{escape(dest)}[/]: [field.value]{text_out}[/]")
             current_thread = reply.thread_id or current_thread
 
 
@@ -723,6 +842,21 @@ def main() -> int:
     profile_group.add_argument("--username")
     profile_parser.add_argument("--timeout", type=float, default=2.0)
 
+    threads_parser = subparsers.add_parser(
+        "threads",
+        help="List/discover recent threads",
+        formatter_class=_RichHelpFormatter,
+    )
+    threads_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    threads_filter = threads_parser.add_mutually_exclusive_group()
+    threads_filter.add_argument("--participant-account", help="Only threads including this account_id")
+    threads_filter.add_argument("--participant-username", help="Only threads including this username")
+    threads_parser.add_argument("--query", default="", help="Filter by thread_id substring")
+    threads_parser.add_argument("--limit", type=int, default=20)
+    threads_parser.add_argument("--soft-limit-tokens", type=int, help="Optional soft threshold override")
+    threads_parser.add_argument("--hard-limit-tokens", type=int, help="Optional hard threshold override")
+    threads_parser.add_argument("--timeout", type=float, default=2.0)
+
     thread_parser = subparsers.add_parser(
         "thread-status",
         help="Inspect thread size/status for compaction decisions",
@@ -734,6 +868,33 @@ def main() -> int:
     thread_parser.add_argument("--hard-limit-tokens", type=int, help="Optional hard threshold override")
     thread_parser.add_argument("--timeout", type=float, default=2.0)
 
+    thread_messages_parser = subparsers.add_parser(
+        "thread-messages",
+        help="Fetch paginated messages from one thread",
+        formatter_class=_RichHelpFormatter,
+    )
+    thread_messages_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    thread_messages_parser.add_argument("--thread-id", required=True)
+    thread_messages_parser.add_argument("--limit", type=int, default=50)
+    thread_messages_parser.add_argument("--cursor", help="Pagination cursor from prior response")
+    thread_messages_parser.add_argument("--timeout", type=float, default=2.0)
+
+    message_search_parser = subparsers.add_parser(
+        "message-search",
+        help="Search messages across threads",
+        formatter_class=_RichHelpFormatter,
+    )
+    message_search_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    message_search_parser.add_argument("--thread-id")
+    message_search_parser.add_argument("--from-account-id")
+    message_search_parser.add_argument("--to-account-id")
+    message_search_parser.add_argument("--kind")
+    message_search_parser.add_argument("--from-ts", help="ISO timestamp lower bound")
+    message_search_parser.add_argument("--to-ts", help="ISO timestamp upper bound")
+    message_search_parser.add_argument("--limit", type=int, default=50)
+    message_search_parser.add_argument("--cursor", help="Pagination cursor from prior response")
+    message_search_parser.add_argument("--timeout", type=float, default=2.0)
+
     send_parser = subparsers.add_parser("send", help="Send a message", formatter_class=_RichHelpFormatter)
     send_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     group = send_parser.add_mutually_exclusive_group(required=True)
@@ -742,6 +903,7 @@ def main() -> int:
     group.add_argument("--to-capability", help="Capability to send to")
     send_parser.add_argument("--thread-id", help="Thread ID to attach")
     send_parser.add_argument("--parent-message-id", help="Parent message ID")
+    send_parser.add_argument("--idempotency-key", help="Optional dedupe key for logical operation")
     send_parser.add_argument("--retry-attempts", type=int, default=2, help="Retries after first publish")
     send_parser.add_argument("--receipt-timeout", type=float, default=1.5, help="Seconds to wait per attempt")
     send_parser.add_argument("--no-ack", action="store_true", help="Disable delivery-ack wait")
@@ -756,6 +918,7 @@ def main() -> int:
     req_group.add_argument("--to-capability", help="Capability to request")
     req_parser.add_argument("--thread-id", help="Thread ID to attach")
     req_parser.add_argument("--parent-message-id", help="Parent message ID")
+    req_parser.add_argument("--idempotency-key", help="Optional dedupe key for logical operation")
     req_parser.add_argument("payload", help="JSON payload string")
 
     watch_parser = subparsers.add_parser("watch", help="Watch live network subjects", formatter_class=_RichHelpFormatter)
@@ -813,6 +976,19 @@ def main() -> int:
                     timeout=args.timeout,
                 )
             )
+        if args.command == "threads":
+            return asyncio.run(
+                _run_thread_list(
+                    nats_url=args.nats_url,
+                    participant_account=args.participant_account,
+                    participant_username=args.participant_username,
+                    query=args.query,
+                    limit=args.limit,
+                    soft_limit_tokens=args.soft_limit_tokens,
+                    hard_limit_tokens=args.hard_limit_tokens,
+                    timeout=args.timeout,
+                )
+            )
         if args.command == "thread-status":
             return asyncio.run(
                 _run_thread_status(
@@ -820,6 +996,31 @@ def main() -> int:
                     thread_id=args.thread_id,
                     soft_limit_tokens=args.soft_limit_tokens,
                     hard_limit_tokens=args.hard_limit_tokens,
+                    timeout=args.timeout,
+                )
+            )
+        if args.command == "thread-messages":
+            return asyncio.run(
+                _run_thread_messages(
+                    nats_url=args.nats_url,
+                    thread_id=args.thread_id,
+                    limit=args.limit,
+                    cursor=args.cursor,
+                    timeout=args.timeout,
+                )
+            )
+        if args.command == "message-search":
+            return asyncio.run(
+                _run_message_search(
+                    nats_url=args.nats_url,
+                    thread_id=args.thread_id,
+                    from_account_id=args.from_account_id,
+                    to_account_id=args.to_account_id,
+                    kind=args.kind,
+                    from_ts=args.from_ts,
+                    to_ts=args.to_ts,
+                    limit=args.limit,
+                    cursor=args.cursor,
                     timeout=args.timeout,
                 )
             )
@@ -833,6 +1034,7 @@ def main() -> int:
                     args.payload,
                     args.thread_id,
                     args.parent_message_id,
+                    args.idempotency_key,
                     args.retry_attempts,
                     args.receipt_timeout,
                     args.no_ack,
@@ -849,6 +1051,7 @@ def main() -> int:
                     args.timeout,
                     args.thread_id,
                     args.parent_message_id,
+                    args.idempotency_key,
                 )
             )
         if args.command == "watch":

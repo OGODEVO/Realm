@@ -74,6 +74,8 @@ class AgentMessage:
     thread_id: str | None = None
     parent_message_id: str | None = None
     kind: str = "direct"
+    schema_version: str = "1.0"
+    idempotency_key: str | None = None
     reply_to: str | None = None
     auth: dict[str, Any] | None = None
 
@@ -101,6 +103,8 @@ class AgentMessage:
             thread_id=str(data.get("thread_id") or "") or None,
             parent_message_id=str(data.get("parent_message_id") or "") or None,
             kind=str(data.get("kind") or "direct"),
+            schema_version=str(data.get("schema_version") or "1.0"),
+            idempotency_key=str(data.get("idempotency_key") or "") or None,
             reply_to=data.get("reply_to"),
             auth=data.get("auth") if isinstance(data.get("auth"), dict) else None,
         )
@@ -113,6 +117,7 @@ class AgentMessage:
             "payload": self.payload,
             "sent_at": self.sent_at,
             "kind": self.kind,
+            "schema_version": self.schema_version or "1.0",
         }
         if self.from_session_tag is not None:
             payload_dict["from_session_tag"] = self.from_session_tag
@@ -130,6 +135,8 @@ class AgentMessage:
             payload_dict["thread_id"] = self.thread_id
         if self.parent_message_id is not None:
             payload_dict["parent_message_id"] = self.parent_message_id
+        if self.idempotency_key is not None:
+            payload_dict["idempotency_key"] = self.idempotency_key
         if self.reply_to is not None:
             payload_dict["reply_to"] = self.reply_to
         if self.auth is not None:
