@@ -11,15 +11,22 @@ wheels/
 venv/
 .env
 agents/.env
+
+# Private keys & credentials
 .keys/
+*.key
+*.pem
+*.p12
+*.pfx
+*.secret
 
 # Databases and Caches
-logs/
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+logs/
 
 # Common IDEs and Caches
 .vscode/
