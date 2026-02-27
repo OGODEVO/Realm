@@ -356,7 +356,29 @@ Thread budget env knobs (registry service):
 
 - `THREAD_SOFT_LIMIT_TOKENS` (default `50000`)
 - `THREAD_HARD_LIMIT_TOKENS` (default `60000`)
+- `THREAD_KEEP_TAIL_MESSAGES` (default `24`)
 - `TOKEN_ESTIMATE_CHARS_PER_TOKEN` (default `4`)
+- `THREAD_COMPACTION_EVENT_ENABLED` (default `true`)
+- `THREAD_COMPACTION_EVENT_COOLDOWN_SECONDS` (default `120`)
+
+When a thread reaches `needs_compaction`, registry can emit a `type=compaction_required` system message to an online participant account to trigger agent-side summarization/checkpointing.
+
+Agent helper API for this event:
+
+```python
+from agentnet import parse_compaction_required
+
+event = parse_compaction_required(msg)  # msg can be AgentMessage or dict
+if event:
+    # build and send checkpoint message for event.thread_id
+    ...
+```
+
+Mesh agents can auto-write checkpoints on this event with:
+
+- `MESH_AUTO_COMPACTION` (default `true`)
+- `MESH_COMPACTION_KEEP_TAIL_MESSAGES` (default `24`)
+- `MESH_COMPACTION_MAX_MESSAGES` (default `400`)
 
 ## Heartbeat requirement (must-have)
 

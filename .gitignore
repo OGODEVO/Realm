@@ -35,5 +35,9 @@ logs/
 .mypy_cache/
 .ruff_cache/
 
+# Realm CLI memory
+.realm/
+realm
 # Node dependencies
 node_modules/
+realm

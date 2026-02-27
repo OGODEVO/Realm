@@ -33,6 +33,7 @@ from agentnet.subjects import (
     REGISTRY_THREAD_LIST_SUBJECT,
     REGISTRY_THREAD_MESSAGES_SUBJECT,
     REGISTRY_THREAD_STATUS_SUBJECT,
+    account_inbox_subject,
 )
 from agentnet.utils import decode_json, encode_json, new_ulid, utc_now_iso
 
@@ -507,6 +508,7 @@ class PostgresSessionStore:
             """
             SELECT
                 thread_id,
+                created_by_account_id,
                 participants,
                 created_at,
                 updated_at,
@@ -525,6 +527,7 @@ class PostgresSessionStore:
         participants = row["participants"] if isinstance(row["participants"], list) else []
         return {
             "thread_id": str(row["thread_id"]),
+            "created_by_account_id": str(row["created_by_account_id"]) if row["created_by_account_id"] is not None else None,
             "participants": [str(item) for item in participants],
             "created_at": _iso_utc(row["created_at"]),
             "updated_at": _iso_utc(row["updated_at"]),
@@ -551,6 +554,7 @@ class PostgresSessionStore:
             """
             SELECT
                 thread_id,
+                created_by_account_id,
                 participants,
                 created_at,
                 updated_at,
@@ -576,6 +580,7 @@ class PostgresSessionStore:
             results.append(
                 {
                     "thread_id": str(row["thread_id"]),
+                    "created_by_account_id": str(row["created_by_account_id"]) if row["created_by_account_id"] is not None else None,
                     "participants": [str(item) for item in participants],
                     "created_at": _iso_utc(row["created_at"]),
                     "updated_at": _iso_utc(row["updated_at"]),
@@ -936,6 +941,7 @@ class RegistryService:
         heartbeat_interval_seconds: float = 12.0,
         thread_soft_limit_tokens: int = 50000,
         thread_hard_limit_tokens: int = 60000,
+        thread_keep_tail_messages: int = 24,
         token_estimate_chars_per_token: float = 4.0,
         server_id: str = "registry",
         database_url: str | None = None,
@@ -943,6 +949,8 @@ class RegistryService:
         dev_auth_enabled: bool = False,
         dev_auth_max_skew_seconds: float = 120.0,
         dev_auth_nonce_ttl_seconds: float = 300.0,
+        compaction_event_enabled: bool = True,
+        compaction_event_cooldown_seconds: float = 120.0,
     ) -> None:
         self.nats_url = nats_url
         self.ttl_seconds = ttl_seconds
@@ -950,12 +958,15 @@ class RegistryService:
         self.heartbeat_interval_seconds = max(1.0, heartbeat_interval_seconds)
         self.thread_soft_limit_tokens = max(1, int(thread_soft_limit_tokens))
         self.thread_hard_limit_tokens = max(self.thread_soft_limit_tokens, int(thread_hard_limit_tokens))
+        self.thread_keep_tail_messages = max(0, int(thread_keep_tail_messages))
         self.token_estimate_chars_per_token = max(1.0, float(token_estimate_chars_per_token))
         self.server_id = server_id
         self.logger = logging.getLogger(f"agentnet.registry.{server_id}")
         self.dev_auth_enabled = bool(dev_auth_enabled)
         self.dev_auth_max_skew_seconds = max(1.0, dev_auth_max_skew_seconds)
         self.dev_auth_nonce_ttl_seconds = max(5.0, dev_auth_nonce_ttl_seconds)
+        self.compaction_event_enabled = bool(compaction_event_enabled)
+        self.compaction_event_cooldown_seconds = max(5.0, float(compaction_event_cooldown_seconds))
 
         self._nc: NATS | None = None
         self._gc_task: asyncio.Task[None] | None = None
@@ -967,6 +978,7 @@ class RegistryService:
         self._local_threads: dict[str, dict[str, Any]] = {}
         self._local_messages: dict[str, dict[str, Any]] = {}
         self._seen_register_nonces: dict[str, float] = {}
+        self._compaction_event_state: dict[str, tuple[int, float]] = {}
         self._store = (
             PostgresSessionStore(
                 database_url,
@@ -1006,6 +1018,7 @@ class RegistryService:
             f"registry ready: nats={self.nats_url} server_id={self.server_id} "
             f"ttl={self.ttl_seconds}s heartbeat={self.heartbeat_interval_seconds}s "
             f"thread_soft={self.thread_soft_limit_tokens} thread_hard={self.thread_hard_limit_tokens} "
+            f"thread_keep_tail={self.thread_keep_tail_messages} "
             f"db={'enabled' if self._store else 'disabled'} "
             f"dev_auth={'enabled' if self.dev_auth_enabled else 'disabled'}"
         )
@@ -1326,12 +1339,20 @@ class RegistryService:
             return
 
         approx_tokens = _coerce_non_negative_int(thread.get("approx_tokens"))
-        status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
+        message_count = _coerce_non_negative_int(thread.get("message_count"))
+        latest_checkpoint_end = _coerce_non_negative_int(thread.get("latest_checkpoint_end"))
+        pending_messages = max(0, message_count - latest_checkpoint_end)
+        if pending_messages <= self.thread_keep_tail_messages:
+            status = "ok"
+        else:
+            status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
         response = {
             **thread,
             "status": status,
+            "pending_messages": pending_messages,
             "soft_limit_tokens": soft_limit_tokens,
             "hard_limit_tokens": hard_limit_tokens,
+            "thread_keep_tail_messages": self.thread_keep_tail_messages,
             "token_estimate_chars_per_token": self.token_estimate_chars_per_token,
             "generated_at": utc_now_iso(),
         }
@@ -1400,11 +1421,18 @@ class RegistryService:
         results: list[dict[str, Any]] = []
         for item in threads:
             approx_tokens = _coerce_non_negative_int(item.get("approx_tokens"))
-            status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
+            message_count = _coerce_non_negative_int(item.get("message_count"))
+            latest_checkpoint_end = _coerce_non_negative_int(item.get("latest_checkpoint_end"))
+            pending_messages = max(0, message_count - latest_checkpoint_end)
+            if pending_messages <= self.thread_keep_tail_messages:
+                status = "ok"
+            else:
+                status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
             results.append(
                 {
                     **item,
                     "status": status,
+                    "pending_messages": pending_messages,
                 }
             )
 
@@ -1546,8 +1574,10 @@ class RegistryService:
                 await self._store.persist_message(message, received_at=_utc_now())
             except Exception:  # noqa: BLE001
                 self.logger.exception("Failed persisting message message_id=%s", message.message_id)
+            await self._maybe_emit_compaction_event(trigger_message=message)
             return
         self._persist_message_local(message)
+        await self._maybe_emit_compaction_event(trigger_message=message)
 
     async def _gc_loop(self) -> None:
         while True:
@@ -1788,6 +1818,7 @@ class RegistryService:
             return None
         return {
             "thread_id": normalized_thread_id,
+            "created_by_account_id": str(thread.get("created_by_account_id") or "") or None,
             "participants": thread.get("participants") if isinstance(thread.get("participants"), list) else [],
             "created_at": str(thread.get("created_at") or ""),
             "updated_at": str(thread.get("updated_at") or ""),
@@ -1825,6 +1856,7 @@ class RegistryService:
             rows.append(
                 {
                     "thread_id": thread_id,
+                    "created_by_account_id": str(thread.get("created_by_account_id") or "") or None,
                     "participants": participant_values,
                     "created_at": str(thread.get("created_at") or ""),
                     "updated_at": str(thread.get("updated_at") or ""),
@@ -2049,6 +2081,8 @@ class RegistryService:
             self._local_threads[thread_id] = existing_thread
         else:
             existing_thread["participants"] = sorted(participants)
+            if not str(existing_thread.get("created_by_account_id") or "").strip():
+                existing_thread["created_by_account_id"] = message.from_account_id
             existing_thread["updated_at"] = now_iso
 
         if is_new_message:
@@ -2202,6 +2236,154 @@ class RegistryService:
         except Exception:  # noqa: BLE001
             self.logger.exception("Failed pruning offline session history")
 
+    @staticmethod
+    def _is_compaction_event_payload(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        payload_type = str(payload.get("type") or "").strip().lower()
+        return payload_type in {"compaction_required", "checkpoint"}
+
+    def _has_online_agent_session(self, account_id: str) -> bool:
+        normalized = str(account_id or "").strip()
+        if not normalized:
+            return False
+        for info in self._sessions.values():
+            if info.account_id == normalized and bool(info.capabilities):
+                return True
+        return False
+
+    def _has_online_session(self, account_id: str) -> bool:
+        normalized = str(account_id or "").strip()
+        if not normalized:
+            return False
+        for info in self._sessions.values():
+            if info.account_id == normalized:
+                return True
+        return False
+
+    def _choose_compaction_target_account(
+        self,
+        *,
+        thread: dict[str, Any],
+        trigger_message: AgentMessage,
+    ) -> str | None:
+        participants = thread.get("participants") if isinstance(thread.get("participants"), list) else []
+        participant_ids = [str(item).strip() for item in participants if str(item).strip()]
+        preferred = [
+            str(trigger_message.to_account_id or "").strip(),
+            str(trigger_message.from_account_id or "").strip(),
+        ]
+        for candidate in preferred:
+            if candidate and self._has_online_agent_session(candidate):
+                return candidate
+        for candidate in participant_ids:
+            if self._has_online_agent_session(candidate):
+                return candidate
+        for candidate in preferred:
+            if candidate and self._has_online_session(candidate):
+                return candidate
+        for candidate in participant_ids:
+            if self._has_online_session(candidate):
+                return candidate
+        fallback = str(thread.get("created_by_account_id") or "").strip()
+        if fallback:
+            return fallback
+        for candidate in preferred:
+            if candidate:
+                return candidate
+        return participant_ids[0] if participant_ids else None
+
+    async def _maybe_emit_compaction_event(self, *, trigger_message: AgentMessage) -> None:
+        if not self.compaction_event_enabled or not self._nc:
+            return
+        thread_id = str(trigger_message.thread_id or "").strip()
+        if not thread_id:
+            return
+        if self._is_compaction_event_payload(trigger_message.payload):
+            return
+        thread = await self._get_thread_status(thread_id)
+        if not thread:
+            return
+        approx_tokens = _coerce_non_negative_int(thread.get("approx_tokens"))
+        status = _classify_thread_status(
+            approx_tokens=approx_tokens,
+            soft_limit_tokens=self.thread_soft_limit_tokens,
+            hard_limit_tokens=self.thread_hard_limit_tokens,
+        )
+        if status != "needs_compaction":
+            self._compaction_event_state.pop(thread_id, None)
+            return
+        latest_checkpoint_end = _coerce_non_negative_int(thread.get("latest_checkpoint_end"))
+        message_count = _coerce_non_negative_int(thread.get("message_count"))
+        pending_messages = max(0, message_count - latest_checkpoint_end)
+        if pending_messages <= self.thread_keep_tail_messages:
+            self._compaction_event_state.pop(thread_id, None)
+            return
+        now_mono = time.monotonic()
+        prior = self._compaction_event_state.get(thread_id)
+        if prior is not None:
+            prior_checkpoint_end, prior_sent_at = prior
+            if latest_checkpoint_end <= prior_checkpoint_end and (now_mono - prior_sent_at) < self.compaction_event_cooldown_seconds:
+                return
+        to_account_id = self._choose_compaction_target_account(thread=thread, trigger_message=trigger_message)
+        if not to_account_id:
+            return
+
+        sent_at_dt = _utc_now()
+        sent_at = _iso_utc(sent_at_dt)
+        expires_at = _iso_utc(sent_at_dt + timedelta(seconds=300))
+        byte_count = _coerce_non_negative_int(thread.get("byte_count"))
+        event_payload = {
+            "type": "compaction_required",
+            "thread_id": thread_id,
+            "status": status,
+            "message_count": message_count,
+            "pending_messages": pending_messages,
+            "byte_count": byte_count,
+            "approx_tokens": approx_tokens,
+            "soft_limit_tokens": self.thread_soft_limit_tokens,
+            "hard_limit_tokens": self.thread_hard_limit_tokens,
+            "keep_tail_messages": self.thread_keep_tail_messages,
+            "latest_checkpoint_end": latest_checkpoint_end,
+            "requested_at": sent_at,
+            "reason": "thread_token_limit_exceeded",
+        }
+        event_message = AgentMessage(
+            message_id=f"msg_{new_ulid().lower()}",
+            from_agent=f"registry_{self.server_id}",
+            to_agent="thread_compactor",
+            payload=event_payload,
+            sent_at=sent_at,
+            from_account_id=f"acct_registry_{self.server_id}",
+            to_account_id=to_account_id,
+            ttl_ms=300_000,
+            expires_at=expires_at,
+            trace_id=f"trace_{new_ulid().lower()}",
+            thread_id=thread_id,
+            parent_message_id=trigger_message.message_id,
+            kind="system",
+            schema_version="1.1",
+            idempotency_key=f"compaction:{thread_id}:{latest_checkpoint_end}:{message_count}",
+        )
+        try:
+            await self._nc.publish(
+                account_inbox_subject(to_account_id),
+                encode_json(event_message.to_dict()),
+            )
+            self._compaction_event_state[thread_id] = (latest_checkpoint_end, now_mono)
+            self.logger.info(
+                "emitted compaction event thread_id=%s to_account_id=%s approx_tokens=%s",
+                thread_id,
+                to_account_id,
+                approx_tokens,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.exception(
+                "failed emitting compaction event thread_id=%s to_account_id=%s",
+                thread_id,
+                to_account_id,
+            )
+
 
 async def amain() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -2212,6 +2394,7 @@ async def amain() -> None:
     heartbeat_interval = float(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "12"))
     thread_soft_limit_tokens = int(os.getenv("THREAD_SOFT_LIMIT_TOKENS", "50000"))
     thread_hard_limit_tokens = int(os.getenv("THREAD_HARD_LIMIT_TOKENS", "60000"))
+    thread_keep_tail_messages = int(os.getenv("THREAD_KEEP_TAIL_MESSAGES", "24"))
     token_estimate_chars_per_token = float(os.getenv("TOKEN_ESTIMATE_CHARS_PER_TOKEN", "4"))
     server_id = os.getenv("REGISTRY_SERVER_ID", "registry")
     database_url = os.getenv("DATABASE_URL")
@@ -2219,6 +2402,8 @@ async def amain() -> None:
     dev_auth_enabled = parse_bool(os.getenv("DEV_AUTH"), default=False)
     dev_auth_max_skew_seconds = float(os.getenv("DEV_AUTH_MAX_SKEW_SECONDS", "120"))
     dev_auth_nonce_ttl_seconds = float(os.getenv("DEV_AUTH_NONCE_TTL_SECONDS", "300"))
+    compaction_event_enabled = parse_bool(os.getenv("THREAD_COMPACTION_EVENT_ENABLED"), default=True)
+    compaction_event_cooldown_seconds = float(os.getenv("THREAD_COMPACTION_EVENT_COOLDOWN_SECONDS", "120"))
 
     service = RegistryService(
         nats_url=nats_url,
@@ -2227,6 +2412,7 @@ async def amain() -> None:
         heartbeat_interval_seconds=heartbeat_interval,
         thread_soft_limit_tokens=thread_soft_limit_tokens,
         thread_hard_limit_tokens=thread_hard_limit_tokens,
+        thread_keep_tail_messages=thread_keep_tail_messages,
         token_estimate_chars_per_token=token_estimate_chars_per_token,
         server_id=server_id,
         database_url=database_url,
@@ -2234,6 +2420,8 @@ async def amain() -> None:
         dev_auth_enabled=dev_auth_enabled,
         dev_auth_max_skew_seconds=dev_auth_max_skew_seconds,
         dev_auth_nonce_ttl_seconds=dev_auth_nonce_ttl_seconds,
+        compaction_event_enabled=compaction_event_enabled,
+        compaction_event_cooldown_seconds=compaction_event_cooldown_seconds,
     )
     await service.start()
 

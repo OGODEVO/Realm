@@ -1,6 +1,7 @@
 """AgentNet public API."""
 
 from agentnet.node import AgentNode
+from agentnet.events import CompactionRequiredEvent, is_compaction_required, parse_compaction_required
 from agentnet.registry import (
     get_profile,
     get_thread_messages,
@@ -32,6 +33,7 @@ __all__ = [
     "AgentMessage",
     "DeliveryReceipt",
     "AgentNode",
+    "CompactionRequiredEvent",
     "AgentSDK",
     "ThreadSession",
     "SDKResult",
@@ -52,4 +54,6 @@ __all__ = [
     "search_messages",
     "get_thread_status",
     "list_threads",
+    "is_compaction_required",
+    "parse_compaction_required",
 ]

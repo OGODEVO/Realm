@@ -12,6 +12,12 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-agentnet}
       POSTGRES_USER: ${POSTGRES_USER:-agentnet}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_local}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-agentnet} -d ${POSTGRES_DB:-agentnet}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
     volumes:
       - agentnet_pg_data:/var/lib/postgresql/data
     restart: unless-stopped
@@ -32,8 +38,10 @@ services:
       DEV_AUTH_MAX_SKEW_SECONDS: "${DEV_AUTH_MAX_SKEW_SECONDS:-120}"
       DEV_AUTH_NONCE_TTL_SECONDS: "${DEV_AUTH_NONCE_TTL_SECONDS:-300}"
     depends_on:
-      - nats
-      - postgres
+      nats:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

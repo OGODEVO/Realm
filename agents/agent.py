@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from agentnet import AgentNode
+from agentnet import AgentNode, parse_compaction_required
 from agentnet.schema import AgentMessage
 
 from mesh_config import AgentProfile, MeshDefaults
@@ -50,6 +50,9 @@ class NetworkAgent:
     _planner_max_tokens: int = field(init=False)
     _final_max_tokens: int = field(init=False)
     _work_timeout_seconds: float = field(init=False)
+    _compaction_auto_enabled: bool = field(init=False)
+    _compaction_keep_tail_messages: int = field(init=False)
+    _compaction_max_messages: int = field(init=False)
 
     def __post_init__(self) -> None:
         self._work_timeout_seconds = max(10.0, float(os.getenv("MESH_WORK_TIMEOUT_SECONDS", "240")))
@@ -75,6 +78,9 @@ class NetworkAgent:
         self._max_tool_loops = max(1, int(os.getenv("MESH_TOOL_LOOP_MAX_STEPS", "3")))
         self._planner_max_tokens = max(128, int(os.getenv("MESH_PLANNER_MAX_TOKENS", "1200")))
         self._final_max_tokens = max(128, int(os.getenv("MESH_FINAL_MAX_TOKENS", "1200")))
+        self._compaction_auto_enabled = os.getenv("MESH_AUTO_COMPACTION", "true").strip().lower() in {"1", "true", "yes", "on"}
+        self._compaction_keep_tail_messages = max(0, int(os.getenv("MESH_COMPACTION_KEEP_TAIL_MESSAGES", "24")))
+        self._compaction_max_messages = max(50, int(os.getenv("MESH_COMPACTION_MAX_MESSAGES", "400")))
         self._wire_handler()
 
     def _time_context_block(self) -> str:
@@ -160,6 +166,135 @@ class NetworkAgent:
             "Tool execution completed, but no final narrative was produced. "
             f"Tools run: {', '.join(unique_tools)}."
         )
+
+    @staticmethod
+    def _is_checkpoint_payload(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        return str(payload.get("type") or "").strip().lower() == "checkpoint"
+
+    @staticmethod
+    def _payload_preview(payload: Any, max_chars: int = 180) -> str:
+        if isinstance(payload, dict):
+            text = str(payload.get("text") or "").strip()
+            if text:
+                return text[:max_chars]
+            try:
+                compact = json.dumps(payload, separators=(",", ":"), ensure_ascii=True)
+            except TypeError:
+                compact = str(payload)
+            return compact[:max_chars]
+        return str(payload or "").strip()[:max_chars]
+
+    async def _fetch_thread_messages_for_compaction(self, thread_id: str) -> list[dict[str, Any]]:
+        rows_desc: list[dict[str, Any]] = []
+        cursor: str | None = None
+        while len(rows_desc) < self._compaction_max_messages:
+            page_size = min(200, self._compaction_max_messages - len(rows_desc))
+            result = await self.node.get_thread_messages(
+                thread_id=thread_id,
+                limit=page_size,
+                cursor=cursor,
+            )
+            messages = result.get("messages") if isinstance(result, dict) else None
+            if not isinstance(messages, list) or not messages:
+                break
+            rows_desc.extend(item for item in messages if isinstance(item, dict))
+            next_cursor = result.get("next_cursor") if isinstance(result, dict) else None
+            cursor = str(next_cursor) if next_cursor else None
+            if not cursor:
+                break
+        return rows_desc
+
+    def _build_checkpoint_summary(
+        self,
+        *,
+        covered_messages: list[dict[str, Any]],
+        covers_start: int,
+        covers_end: int,
+        total_messages_seen: int,
+    ) -> str:
+        if not covered_messages:
+            return "No historical messages were available for checkpoint coverage."
+
+        sample = covered_messages[-12:]
+        lines: list[str] = []
+        for item in sample:
+            actor = str(item.get("from_agent") or item.get("from_account_id") or "unknown")
+            kind = str(item.get("kind") or "direct")
+            payload_preview = self._payload_preview(item.get("payload"))
+            if payload_preview:
+                lines.append(f"- {actor} [{kind}]: {payload_preview}")
+            else:
+                lines.append(f"- {actor} [{kind}]")
+        sample_text = "\n".join(lines)
+        return (
+            f"Checkpoint summary for thread history messages {covers_start}..{covers_end} "
+            f"(observed total={total_messages_seen}).\n"
+            "Recent covered sample:\n"
+            f"{sample_text}"
+        )
+
+    async def _handle_compaction_required(self, *, msg: AgentMessage, thread_id: str) -> bool:
+        if not self._compaction_auto_enabled:
+            return False
+        event = parse_compaction_required(msg)
+        if event is None:
+            return False
+
+        rows_desc = await self._fetch_thread_messages_for_compaction(thread_id)
+        rows = list(reversed(rows_desc))
+        observed_total = max(event.message_count, len(rows))
+        covers_start = max(1, event.latest_checkpoint_end + 1)
+        covers_end = max(covers_start - 1, observed_total - self._compaction_keep_tail_messages)
+        if covers_end < covers_start:
+            return False
+
+        covered_count = min(len(rows), covers_end)
+        covered_messages = rows[:covered_count]
+        summary = self._build_checkpoint_summary(
+            covered_messages=covered_messages,
+            covers_start=covers_start,
+            covers_end=covers_end,
+            total_messages_seen=observed_total,
+        )
+        checkpoint_payload = {
+            "type": "checkpoint",
+            "summary_version": "v1",
+            "covers_start": covers_start,
+            "covers_end": covers_end,
+            "keep_tail_messages": self._compaction_keep_tail_messages,
+            "summary": summary,
+            "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "generated_by": self.profile.username,
+        }
+        target_account_id = self.node.account_id or msg.to_account_id or msg.from_account_id
+        if not target_account_id:
+            return False
+
+        await self.node.send_to_account(
+            to_account_id=target_account_id,
+            payload=checkpoint_payload,
+            kind="system",
+            thread_id=thread_id,
+            parent_message_id=msg.message_id,
+            idempotency_key=f"checkpoint:{thread_id}:{covers_end}",
+            require_delivery_ack=False,
+        )
+        print_event(
+            self.profile.key.upper(),
+            "A_CHECKPOINT",
+            f"Checkpoint written: covers {covers_start}-{covers_end}.",
+            peer=msg.from_agent,
+            session_tag=self.node.session_tag,
+            trace_id=msg.trace_id,
+            thread_id=thread_id,
+            parent_message_id=msg.message_id,
+            status="checkpoint_written",
+            extra={"observed_total": observed_total, "kept_tail": self._compaction_keep_tail_messages},
+            max_chars=600,
+        )
+        return True
 
     def _network_inference_user_block(self, *, msg: AgentMessage, payload: dict[str, Any], user_text: str, thread_id: str) -> str:
         inference = {
@@ -306,11 +441,30 @@ class NetworkAgent:
         @self.node.on_message
         async def _handle(msg: AgentMessage) -> None:
             payload = msg.payload if isinstance(msg.payload, dict) else {"text": str(msg.payload)}
+            thread_id = msg.thread_id or f"thread_{msg.trace_id or msg.message_id}"
+
+            if self._is_checkpoint_payload(payload):
+                print_event(
+                    self.profile.key.upper(),
+                    "RECV",
+                    "Checkpoint message received; skipping model loop.",
+                    peer=msg.from_agent,
+                    session_tag=msg.from_session_tag,
+                    trace_id=msg.trace_id,
+                    thread_id=thread_id,
+                    message_id=msg.message_id,
+                    status=msg.kind,
+                    max_chars=600,
+                )
+                return
+
+            if await self._handle_compaction_required(msg=msg, thread_id=thread_id):
+                return
+
             user_text = str(payload.get("text") or "").strip()
             if not user_text:
                 user_text = "No user text was provided."
 
-            thread_id = msg.thread_id or f"thread_{msg.trace_id or msg.message_id}"
             history = self._history_by_thread[thread_id]
             history.append({"role": "user", "content": f"{msg.from_agent}: {user_text}"})
             if len(history) > self.defaults.max_history_messages:
