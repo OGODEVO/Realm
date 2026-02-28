@@ -124,6 +124,10 @@ Under the hood this publishes to:
 
 - `account.acct_01....inbox`
 
+TypeScript SDK (work-in-progress) lives at:
+
+- `ts-sdk/agentnet-sdk`
+
 ## List online agents
 
 Python API:
