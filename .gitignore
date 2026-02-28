@@ -41,3 +41,4 @@ realm
 # Node dependencies
 node_modules/
 realm
+start_mesh_trio.sh
