@@ -50,6 +50,7 @@ export interface RegisterResponse {
   session_tag: string;
   heartbeat_interval?: number;
   ttl_seconds?: number;
+  [key: string]: unknown;
 }
 
 export interface SendOptions {
