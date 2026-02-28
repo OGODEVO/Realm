@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import defaultdict, deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -150,6 +151,16 @@ class AgentNode:
         self._retry_count = 0
         self._receipt_timeout_count = 0
         self._handle_time_total_ms = 0.0
+        self._metrics_window_size = max(32, int(os.getenv("AGENT_METRICS_WINDOW_SIZE", "1024")))
+        self._latency_samples: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self._metrics_window_size)
+        )
+        self._username_resolve_cache_ttl_seconds = max(
+            0.0, float(os.getenv("ACCOUNT_RESOLVE_CACHE_TTL_SECONDS", "60"))
+        )
+        self._username_account_cache: dict[str, tuple[str, float]] = {}
+        self._username_cache_hits = 0
+        self._username_cache_misses = 0
 
     @property
     def info(self) -> AgentInfo:
@@ -171,6 +182,7 @@ class AgentNode:
     def metrics_snapshot(self) -> dict[str, Any]:
         pending_count = self._incoming_queue.qsize() if self._incoming_queue is not None else 0
         avg_ms = (self._handle_time_total_ms / self._processed_count) if self._processed_count else 0.0
+        self._prune_username_cache(time.monotonic())
         return {
             "account_id": self.account_id,
             "username": self.username,
@@ -191,7 +203,55 @@ class AgentNode:
             "receipt_timeout_count": self._receipt_timeout_count,
             "avg_handle_ms": round(avg_ms, 2),
             "circuit_open": self._is_circuit_open(),
+            "latency_ms": {
+                "send_account": self._latency_stats("send_account"),
+                "request_account": self._latency_stats("request_account"),
+                "resolve_username": self._latency_stats("resolve_username"),
+            },
+            "username_cache": {
+                "ttl_seconds": self._username_resolve_cache_ttl_seconds,
+                "size": len(self._username_account_cache),
+                "hits": self._username_cache_hits,
+                "misses": self._username_cache_misses,
+            },
         }
+
+    @staticmethod
+    def _percentile(samples: list[float], percentile: float) -> float:
+        if not samples:
+            return 0.0
+        if percentile <= 0:
+            return samples[0]
+        if percentile >= 100:
+            return samples[-1]
+        idx = int(round((percentile / 100.0) * (len(samples) - 1)))
+        idx = max(0, min(idx, len(samples) - 1))
+        return samples[idx]
+
+    def _record_latency(self, metric_name: str, elapsed_ms: float) -> None:
+        if elapsed_ms < 0:
+            elapsed_ms = 0.0
+        self._latency_samples[metric_name].append(float(elapsed_ms))
+
+    def _latency_stats(self, metric_name: str) -> dict[str, float | int]:
+        samples = list(self._latency_samples.get(metric_name, ()))
+        if not samples:
+            return {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0}
+        samples.sort()
+        return {
+            "count": len(samples),
+            "p50": round(self._percentile(samples, 50), 2),
+            "p95": round(self._percentile(samples, 95), 2),
+            "p99": round(self._percentile(samples, 99), 2),
+        }
+
+    def _prune_username_cache(self, now: float | None = None) -> None:
+        if self._username_resolve_cache_ttl_seconds <= 0 or not self._username_account_cache:
+            return
+        check_at = now if now is not None else time.monotonic()
+        expired = [k for k, (_, expires_at) in self._username_account_cache.items() if expires_at <= check_at]
+        for key in expired:
+            self._username_account_cache.pop(key, None)
 
     async def start(self) -> None:
         if self._nc and self._nc.is_connected:
@@ -341,30 +401,34 @@ class AgentNode:
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
     ) -> str:
+        started = time.perf_counter()
         account_id = to_account_id.strip()
         if not account_id:
             raise ValueError("to_account_id is required")
-        nc = self._require_connected_client()
-        envelope = self._build_outbound_message(
-            to=account_id,
-            payload=payload,
-            kind=kind,
-            ttl_ms=ttl_ms,
-            trace_id=trace_id,
-            to_account_id=account_id,
-            thread_id=thread_id,
-            parent_message_id=parent_message_id,
-            idempotency_key=idempotency_key,
-        )
-        await self._publish_with_retry(
-            nc=nc,
-            subject=account_inbox_subject(account_id),
-            envelope=envelope,
-            require_delivery_ack=require_delivery_ack,
-            retry_attempts=retry_attempts,
-            receipt_timeout=receipt_timeout,
-        )
-        return envelope.message_id
+        try:
+            nc = self._require_connected_client()
+            envelope = self._build_outbound_message(
+                to=account_id,
+                payload=payload,
+                kind=kind,
+                ttl_ms=ttl_ms,
+                trace_id=trace_id,
+                to_account_id=account_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
+            )
+            await self._publish_with_retry(
+                nc=nc,
+                subject=account_inbox_subject(account_id),
+                envelope=envelope,
+                require_delivery_ack=require_delivery_ack,
+                retry_attempts=retry_attempts,
+                receipt_timeout=receipt_timeout,
+            )
+            return envelope.message_id
+        finally:
+            self._record_latency("send_account", (time.perf_counter() - started) * 1000.0)
 
     async def send_to_username(
         self,
@@ -486,26 +550,30 @@ class AgentNode:
         parent_message_id: str | None = None,
         idempotency_key: str | None = None,
     ) -> AgentMessage:
+        started = time.perf_counter()
         account_id = to_account_id.strip()
         if not account_id:
             raise ValueError("to_account_id is required")
-        nc = self._require_connected_client()
-        envelope = self._build_outbound_message(
-            to=account_id,
-            payload=payload,
-            kind=kind,
-            ttl_ms=ttl_ms,
-            trace_id=trace_id,
-            to_account_id=account_id,
-            thread_id=thread_id,
-            parent_message_id=parent_message_id,
-            idempotency_key=idempotency_key,
-        )
-        reply_msg = await nc.request(account_inbox_subject(account_id), self._encode_message(envelope), timeout=timeout)
-        data = decode_json(reply_msg.data)
-        if not isinstance(data, dict):
-            raise ValueError("reply message payload must be a JSON object")
-        return AgentMessage.from_dict(data)
+        try:
+            nc = self._require_connected_client()
+            envelope = self._build_outbound_message(
+                to=account_id,
+                payload=payload,
+                kind=kind,
+                ttl_ms=ttl_ms,
+                trace_id=trace_id,
+                to_account_id=account_id,
+                thread_id=thread_id,
+                parent_message_id=parent_message_id,
+                idempotency_key=idempotency_key,
+            )
+            reply_msg = await nc.request(account_inbox_subject(account_id), self._encode_message(envelope), timeout=timeout)
+            data = decode_json(reply_msg.data)
+            if not isinstance(data, dict):
+                raise ValueError("reply message payload must be a JSON object")
+            return AgentMessage.from_dict(data)
+        finally:
+            self._record_latency("request_account", (time.perf_counter() - started) * 1000.0)
 
     async def request_username(
         self,
@@ -562,21 +630,46 @@ class AgentNode:
         return envelope.message_id
 
     async def resolve_account_id_by_username(self, username: str, timeout: float = 2.0) -> str:
+        started = time.perf_counter()
         target = username.strip().lower().lstrip("@")
         if not target:
             raise ValueError("username is required")
+        now_mono = time.monotonic()
+        self._prune_username_cache(now_mono)
+        cached = self._username_account_cache.get(target)
+        if cached is not None:
+            account_id, expires_at = cached
+            if self._username_resolve_cache_ttl_seconds <= 0 or expires_at > now_mono:
+                self._username_cache_hits += 1
+                self._record_latency("resolve_username", (time.perf_counter() - started) * 1000.0)
+                return account_id
+            self._username_account_cache.pop(target, None)
+        self._username_cache_misses += 1
         # Prefer dedicated resolve RPC; fall back to list scan for compatibility with older registries.
         try:
             if self._nc and self._nc.is_connected:
                 account_id, _ = await resolve_account_by_username_with_client(self._nc, target, timeout=timeout)
             else:
                 account_id, _ = await resolve_account_by_username(self.nats_url, target, timeout=timeout)
+            if self._username_resolve_cache_ttl_seconds > 0:
+                self._username_account_cache[target] = (
+                    account_id,
+                    time.monotonic() + self._username_resolve_cache_ttl_seconds,
+                )
+            self._record_latency("resolve_username", (time.perf_counter() - started) * 1000.0)
             return account_id
         except Exception:  # noqa: BLE001
             agents = await self.list_online_agents(timeout=timeout)
             for agent in agents:
                 if agent.account_id and agent.username and agent.username.lower() == target:
+                    if self._username_resolve_cache_ttl_seconds > 0:
+                        self._username_account_cache[target] = (
+                            agent.account_id,
+                            time.monotonic() + self._username_resolve_cache_ttl_seconds,
+                        )
+                    self._record_latency("resolve_username", (time.perf_counter() - started) * 1000.0)
                     return agent.account_id
+        self._record_latency("resolve_username", (time.perf_counter() - started) * 1000.0)
         raise RuntimeError(f"No account found for username '{target}'")
 
     async def request_capability(

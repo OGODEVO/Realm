@@ -19,6 +19,7 @@ from rich.theme import Theme
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
 from agentnet.registry import (
+    get_registry_metrics,
     get_profile,
     get_thread_messages,
     get_thread_status,
@@ -153,6 +154,80 @@ async def _run_list(nats_url: str, timeout: float) -> int:
         )
 
     console.print(table)
+    return 0
+
+
+# ──────────────────────────────────────────────
+# metrics
+# ──────────────────────────────────────────────
+
+async def _run_metrics(nats_url: str, timeout: float) -> int:
+    with console.status("[info]Fetching registry metrics…[/]", spinner="dots"):
+        metrics = await get_registry_metrics(nats_url=nats_url, timeout=timeout)
+
+    summary = Table(border_style="bright_black", show_header=False, show_edge=True, expand=False)
+    summary.add_column("k", style="field.label", no_wrap=True)
+    summary.add_column("v", style="field.value")
+    summary.add_row("Server", str(metrics.get("server_id") or "registry"))
+    summary.add_row("Generated", str(metrics.get("generated_at") or "—"))
+    summary.add_row("Window", str(metrics.get("window_size") or "—"))
+    summary.add_row("Store", "enabled" if metrics.get("store_enabled") else "disabled")
+    queue_stats = metrics.get("db_write_queue") if isinstance(metrics.get("db_write_queue"), dict) else {}
+    if queue_stats:
+        summary.add_row("DB Queue", "enabled" if queue_stats.get("enabled") else "disabled")
+        summary.add_row("Queue Size", str(queue_stats.get("size", 0)))
+        summary.add_row("Queue Max", str(queue_stats.get("max", 0)))
+        summary.add_row("Batch", str(queue_stats.get("batch_size", 0)))
+        summary.add_row("Flush ms", str(queue_stats.get("flush_ms", 0)))
+        summary.add_row("Overflows", str(queue_stats.get("overflow_count", 0)))
+    console.print(summary)
+
+    latency = metrics.get("latency_ms")
+    if isinstance(latency, dict) and latency:
+        table = Table(
+            title="[info]Latency Percentiles (ms)[/]",
+            border_style="bright_black",
+            title_justify="left",
+            show_edge=True,
+            expand=True,
+        )
+        table.add_column("Metric", style="field.value")
+        table.add_column("Count", justify="right", style="field.value")
+        table.add_column("p50", justify="right", style="field.value")
+        table.add_column("p95", justify="right", style="field.value")
+        table.add_column("p99", justify="right", style="field.value")
+        for name in sorted(latency.keys()):
+            row = latency.get(name)
+            if not isinstance(row, dict):
+                continue
+            table.add_row(
+                name,
+                str(row.get("count", 0)),
+                str(row.get("p50", 0.0)),
+                str(row.get("p95", 0.0)),
+                str(row.get("p99", 0.0)),
+            )
+        console.print(table)
+
+    handlers = metrics.get("handlers")
+    if isinstance(handlers, dict) and handlers:
+        table = Table(
+            title="[info]Handler Calls / Errors[/]",
+            border_style="bright_black",
+            title_justify="left",
+            show_edge=True,
+            expand=True,
+        )
+        table.add_column("Handler", style="field.value")
+        table.add_column("Calls", justify="right", style="field.value")
+        table.add_column("Errors", justify="right", style="field.value")
+        for name in sorted(handlers.keys()):
+            row = handlers.get(name)
+            if not isinstance(row, dict):
+                continue
+            table.add_row(name, str(row.get("calls", 0)), str(row.get("errors", 0)))
+        console.print(table)
+
     return 0
 
 
@@ -842,6 +917,14 @@ def main() -> int:
     profile_group.add_argument("--username")
     profile_parser.add_argument("--timeout", type=float, default=2.0)
 
+    metrics_parser = subparsers.add_parser(
+        "metrics",
+        help="Show registry latency percentiles and handler stats",
+        formatter_class=_RichHelpFormatter,
+    )
+    metrics_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    metrics_parser.add_argument("--timeout", type=float, default=2.0)
+
     threads_parser = subparsers.add_parser(
         "threads",
         help="List/discover recent threads",
@@ -976,6 +1059,8 @@ def main() -> int:
                     timeout=args.timeout,
                 )
             )
+        if args.command == "metrics":
+            return asyncio.run(_run_metrics(nats_url=args.nats_url, timeout=args.timeout))
         if args.command == "threads":
             return asyncio.run(
                 _run_thread_list(

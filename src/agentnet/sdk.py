@@ -8,7 +8,7 @@ from typing import Any
 
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
-from agentnet.registry import get_thread_status
+from agentnet.registry import get_registry_metrics, get_thread_status
 from agentnet.schema import AgentInfo, AgentMessage
 
 ReceiveHandler = Callable[[AgentMessage], Awaitable[None]]
@@ -427,7 +427,7 @@ class AgentWrapper:
         limit: int = 50,
         cursor: str | None = None,
         timeout: float = 2.0,
-    ) -> dict[str, Any]:
+        ) -> dict[str, Any]:
         return await self._node.search_messages(
             thread_id=thread_id,
             from_account_id=from_account_id,
@@ -439,6 +439,9 @@ class AgentWrapper:
             cursor=cursor,
             timeout=timeout,
         )
+
+    async def registry_metrics(self, timeout: float = 2.0) -> dict[str, Any]:
+        return await get_registry_metrics(self._node.nats_url, timeout=timeout)
 
     @staticmethod
     def _validate_target(
@@ -476,6 +479,9 @@ class ThreadSession:
         *,
         parent_message_id: str | None = None,
         idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
     ) -> SDKResult:
         parent = parent_message_id if parent_message_id is not None else self.parent_message_id
         result = await self._sdk.send_text(
@@ -484,6 +490,9 @@ class ThreadSession:
             thread_id=self.thread_id,
             parent_message_id=parent,
             idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
         )
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
@@ -516,6 +525,9 @@ class ThreadSession:
         *,
         parent_message_id: str | None = None,
         idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
     ) -> SDKResult:
         parent = parent_message_id if parent_message_id is not None else self.parent_message_id
         result = await self._sdk.send_json(
@@ -524,6 +536,9 @@ class ThreadSession:
             thread_id=self.thread_id,
             parent_message_id=parent,
             idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
         )
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
@@ -708,7 +723,7 @@ class AgentSDK:
         limit: int = 50,
         cursor: str | None = None,
         timeout: float = 2.0,
-    ) -> dict[str, Any]:
+        ) -> dict[str, Any]:
         return await self._node.search_messages(
             thread_id=thread_id,
             from_account_id=from_account_id,
@@ -721,6 +736,9 @@ class AgentSDK:
             timeout=timeout,
         )
 
+    async def registry_metrics(self, timeout: float = 2.0) -> dict[str, Any]:
+        return await get_registry_metrics(self._node.nats_url, timeout=timeout)
+
     async def send_text(
         self,
         to: str,
@@ -729,6 +747,9 @@ class AgentSDK:
         thread_id: str | None = None,
         parent_message_id: str | None = None,
         idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
     ) -> SDKResult:
         return await self.send_json(
             to,
@@ -736,6 +757,9 @@ class AgentSDK:
             thread_id=thread_id,
             parent_message_id=parent_message_id,
             idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
         )
 
     async def ask_text(

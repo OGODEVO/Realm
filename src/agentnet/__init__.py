@@ -3,6 +3,7 @@
 from agentnet.node import AgentNode
 from agentnet.events import CompactionRequiredEvent, is_compaction_required, parse_compaction_required
 from agentnet.registry import (
+    get_registry_metrics,
     get_profile,
     get_thread_messages,
     get_thread_status,
@@ -50,6 +51,7 @@ __all__ = [
     "list_online_agents",
     "search_profiles",
     "get_profile",
+    "get_registry_metrics",
     "get_thread_messages",
     "search_messages",
     "get_thread_status",

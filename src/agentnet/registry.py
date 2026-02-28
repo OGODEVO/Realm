@@ -10,6 +10,7 @@ from nats.errors import NoServersError, TimeoutError
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.schema import AgentInfo
 from agentnet.subjects import (
+    REGISTRY_METRICS_SUBJECT,
     REGISTRY_MESSAGE_SEARCH_SUBJECT,
     REGISTRY_LIST_SUBJECT,
     REGISTRY_PROFILE_SUBJECT,
@@ -554,4 +555,43 @@ async def search_messages_with_client(
         raise RuntimeError("registry.message_search response must be an object")
     if "error" in data:
         raise RuntimeError(str(data.get("error") or "message_search_failed"))
+    return data
+
+
+async def get_registry_metrics(
+    nats_url: str,
+    *,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await get_registry_metrics_with_client(nc, timeout=timeout)
+    finally:
+        await nc.drain()
+
+
+async def get_registry_metrics_with_client(
+    nc: NATS,
+    *,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    try:
+        response = await nc.request(REGISTRY_METRICS_SUBJECT, encode_json({}), timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.metrics") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.metrics response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "metrics_failed"))
     return data

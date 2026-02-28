@@ -11,6 +11,8 @@ import os
 import re
 import signal
 import time
+from collections import defaultdict, deque
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -24,6 +26,7 @@ from agentnet.subjects import (
     REGISTRY_GOODBYE_SUBJECT,
     REGISTRY_HELLO_SUBJECT,
     REGISTRY_LIST_SUBJECT,
+    REGISTRY_METRICS_SUBJECT,
     REGISTRY_MESSAGE_SEARCH_SUBJECT,
     REGISTRY_PROFILE_SUBJECT,
     REGISTRY_REGISTER_SUBJECT,
@@ -724,12 +727,10 @@ class PostgresSessionStore:
             next_cursor = _encode_cursor(sent_at=last_row["sent_at"], message_id=str(last_row["message_id"]))
         return messages, next_cursor
 
-    async def persist_message(self, message: AgentMessage, received_at: datetime) -> None:
-        if self._pool is None:
-            return
+    async def _persist_message_with_conn(self, conn: Any, message: AgentMessage, received_at: datetime) -> bool:
         message_id = str(message.message_id or "").strip()
         if not message_id:
-            return
+            return False
         thread_id = str(message.thread_id or "").strip() or f"thread_{(message.trace_id or message_id).lower()}"
         participant_values = [str(v).strip() for v in (message.from_account_id, message.to_account_id) if str(v or "").strip()]
         merged_participants = sorted(set(participant_values))
@@ -747,74 +748,88 @@ class PostgresSessionStore:
             "expires_at": message.expires_at,
             "auth_scheme": str((message.auth or {}).get("scheme") or ""),
         }
-        async with self._pool.acquire() as conn, conn.transaction():
+        await conn.execute(
+            """
+            INSERT INTO agent_threads (thread_id, created_by_account_id, participants, title, metadata, created_at, updated_at)
+            VALUES ($1, $2, $3::jsonb, '', $4::jsonb, $5, $5)
+            ON CONFLICT (thread_id) DO UPDATE
+            SET
+                participants = (
+                    SELECT to_jsonb(ARRAY(
+                        SELECT DISTINCT value
+                        FROM jsonb_array_elements_text(
+                            COALESCE(agent_threads.participants, '[]'::jsonb) || EXCLUDED.participants
+                        ) AS t(value)
+                    ))
+                ),
+                updated_at = EXCLUDED.updated_at
+            """,
+            thread_id,
+            message.from_account_id,
+            json.dumps(merged_participants),
+            json.dumps({}),
+            received_at,
+        )
+        insert_result = await conn.execute(
+            """
+            INSERT INTO agent_messages (
+                message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id, to_agent,
+                kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, 'received', $15::jsonb)
+            ON CONFLICT (message_id) DO NOTHING
+            """,
+            message_id,
+            thread_id,
+            message.parent_message_id,
+            message.from_account_id,
+            message.from_session_tag,
+            message.to_account_id,
+            message.to_agent,
+            message.kind,
+            str(message.schema_version or "1.0"),
+            str(message.idempotency_key or "") or None,
+            payload_json,
+            message.trace_id,
+            sent_at,
+            received_at,
+            json.dumps(metadata_payload),
+        )
+        inserted = insert_result.endswith("1")
+        if inserted:
             await conn.execute(
                 """
-                INSERT INTO agent_threads (thread_id, created_by_account_id, participants, title, metadata, created_at, updated_at)
-                VALUES ($1, $2, $3::jsonb, '', $4::jsonb, $5, $5)
-                ON CONFLICT (thread_id) DO UPDATE
+                UPDATE agent_threads
                 SET
-                    participants = (
-                        SELECT to_jsonb(ARRAY(
-                            SELECT DISTINCT value
-                            FROM jsonb_array_elements_text(
-                                COALESCE(agent_threads.participants, '[]'::jsonb) || EXCLUDED.participants
-                            ) AS t(value)
-                        ))
-                    ),
-                    updated_at = EXCLUDED.updated_at
+                    message_count = COALESCE(message_count, 0) + $2,
+                    byte_count = COALESCE(byte_count, 0) + $3,
+                    approx_tokens = COALESCE(approx_tokens, 0) + $4,
+                    latest_checkpoint_end = GREATEST(COALESCE(latest_checkpoint_end, 0), $5),
+                    last_message_at = GREATEST(COALESCE(last_message_at, $6), $6),
+                    updated_at = GREATEST(updated_at, $6)
+                WHERE thread_id = $1
                 """,
                 thread_id,
-                message.from_account_id,
-                json.dumps(merged_participants),
-                json.dumps({}),
-                received_at,
-            )
-            insert_result = await conn.execute(
-                """
-                INSERT INTO agent_messages (
-                    message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id, to_agent,
-                    kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
-                )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, 'received', $15::jsonb)
-                ON CONFLICT (message_id) DO NOTHING
-                """,
-                message_id,
-                thread_id,
-                message.parent_message_id,
-                message.from_account_id,
-                message.from_session_tag,
-                message.to_account_id,
-                message.to_agent,
-                message.kind,
-                str(message.schema_version or "1.0"),
-                str(message.idempotency_key or "") or None,
-                payload_json,
-                message.trace_id,
+                1,
+                payload_bytes,
+                payload_tokens,
+                checkpoint_end,
                 sent_at,
-                received_at,
-                json.dumps(metadata_payload),
             )
-            inserted = insert_result.endswith("1")
-            if inserted:
-                await conn.execute(
-                    """
-                    UPDATE agent_threads
-                    SET
-                        message_count = COALESCE(message_count, 0) + 1,
-                        byte_count = COALESCE(byte_count, 0) + $2,
-                        approx_tokens = COALESCE(approx_tokens, 0) + $3,
-                        latest_checkpoint_end = GREATEST(COALESCE(latest_checkpoint_end, 0), $4),
-                        last_message_at = GREATEST(COALESCE(last_message_at, $5), $5),
-                        updated_at = GREATEST(updated_at, $5)
-                    WHERE thread_id = $1
-                    """,
-                    thread_id,
-                    payload_bytes,
-                    payload_tokens,
-                    checkpoint_end,
-                    sent_at,
-                )
+        return inserted
+
+    async def persist_message(self, message: AgentMessage, received_at: datetime) -> None:
+        if self._pool is None:
+            return
+        async with self._pool.acquire() as conn, conn.transaction():
+            await self._persist_message_with_conn(conn, message, received_at)
+
+    async def persist_messages_batch(self, items: list[tuple[AgentMessage, datetime]]) -> None:
+        if self._pool is None or not items:
+            return
+        async with self._pool.acquire() as conn, conn.transaction():
+            for message, received_at in items:
+                await self._persist_message_with_conn(conn, message, received_at)
 
     async def _next_available_username(self, conn: Any, base: str) -> str:
         taken = await conn.fetchval("SELECT account_id FROM agent_accounts WHERE username = $1", base)
@@ -951,6 +966,10 @@ class RegistryService:
         dev_auth_nonce_ttl_seconds: float = 300.0,
         compaction_event_enabled: bool = True,
         compaction_event_cooldown_seconds: float = 120.0,
+        db_write_batch_enabled: bool = True,
+        db_write_batch_size: int = 64,
+        db_write_flush_ms: float = 40.0,
+        db_write_queue_max: int = 10000,
     ) -> None:
         self.nats_url = nats_url
         self.ttl_seconds = ttl_seconds
@@ -967,6 +986,10 @@ class RegistryService:
         self.dev_auth_nonce_ttl_seconds = max(5.0, dev_auth_nonce_ttl_seconds)
         self.compaction_event_enabled = bool(compaction_event_enabled)
         self.compaction_event_cooldown_seconds = max(5.0, float(compaction_event_cooldown_seconds))
+        self.db_write_batch_enabled = bool(db_write_batch_enabled)
+        self.db_write_batch_size = max(1, int(db_write_batch_size))
+        self.db_write_flush_seconds = max(0.001, float(db_write_flush_ms) / 1000.0)
+        self.db_write_queue_max = max(100, int(db_write_queue_max))
 
         self._nc: NATS | None = None
         self._gc_task: asyncio.Task[None] | None = None
@@ -979,6 +1002,15 @@ class RegistryService:
         self._local_messages: dict[str, dict[str, Any]] = {}
         self._seen_register_nonces: dict[str, float] = {}
         self._compaction_event_state: dict[str, tuple[int, float]] = {}
+        self._db_write_queue: asyncio.Queue[tuple[AgentMessage, datetime] | None] | None = None
+        self._db_write_worker_task: asyncio.Task[None] | None = None
+        self._db_write_queue_overflow_count = 0
+        self._metrics_window_size = max(32, int(os.getenv("REGISTRY_METRICS_WINDOW_SIZE", "1024")))
+        self._latency_samples: dict[str, deque[float]] = defaultdict(
+            lambda: deque(maxlen=self._metrics_window_size)
+        )
+        self._handler_calls: dict[str, int] = defaultdict(int)
+        self._handler_errors: dict[str, int] = defaultdict(int)
         self._store = (
             PostgresSessionStore(
                 database_url,
@@ -993,25 +1025,62 @@ class RegistryService:
     async def start(self) -> None:
         if self._store is not None:
             await self._store.start()
+            if self.db_write_batch_enabled:
+                self._db_write_queue = asyncio.Queue(maxsize=self.db_write_queue_max)
+                self._db_write_worker_task = asyncio.create_task(
+                    self._db_write_loop(),
+                    name=f"agentnet-registry-db-writer-{self.server_id}",
+                )
 
         self._nc = NATS()
         await self._nc.connect(servers=[self.nats_url], name="agentnet-registry")
 
-        await self._nc.subscribe(REGISTRY_REGISTER_SUBJECT, cb=self._on_register)
-        await self._nc.subscribe(REGISTRY_HELLO_SUBJECT, cb=self._on_hello)
-        await self._nc.subscribe(REGISTRY_GOODBYE_SUBJECT, cb=self._on_goodbye)
-        await self._nc.subscribe(REGISTRY_LIST_SUBJECT, cb=self._on_list)
-        await self._nc.subscribe(REGISTRY_RESOLVE_ACCOUNT_SUBJECT, cb=self._on_resolve_account)
-        await self._nc.subscribe(REGISTRY_RESOLVE_KEY_SUBJECT, cb=self._on_resolve_key)
-        await self._nc.subscribe(REGISTRY_SEARCH_SUBJECT, cb=self._on_search)
-        await self._nc.subscribe(REGISTRY_PROFILE_SUBJECT, cb=self._on_profile)
-        await self._nc.subscribe(REGISTRY_THREAD_STATUS_SUBJECT, cb=self._on_thread_status)
-        await self._nc.subscribe(REGISTRY_THREAD_LIST_SUBJECT, cb=self._on_thread_list)
-        await self._nc.subscribe(REGISTRY_THREAD_MESSAGES_SUBJECT, cb=self._on_thread_messages)
-        await self._nc.subscribe(REGISTRY_MESSAGE_SEARCH_SUBJECT, cb=self._on_message_search)
-        await self._nc.subscribe("account.*.inbox", cb=self._on_account_message)
-        await self._nc.subscribe("agent.capability.*", cb=self._on_account_message)
-        await self._nc.subscribe("_INBOX.>", cb=self._on_account_message)
+        await self._nc.subscribe(REGISTRY_REGISTER_SUBJECT, cb=self._instrument_handler("register", self._on_register))
+        await self._nc.subscribe(REGISTRY_HELLO_SUBJECT, cb=self._instrument_handler("hello", self._on_hello))
+        await self._nc.subscribe(REGISTRY_GOODBYE_SUBJECT, cb=self._instrument_handler("goodbye", self._on_goodbye))
+        await self._nc.subscribe(REGISTRY_LIST_SUBJECT, cb=self._instrument_handler("list", self._on_list))
+        await self._nc.subscribe(
+            REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
+            cb=self._instrument_handler("resolve_account", self._on_resolve_account),
+        )
+        await self._nc.subscribe(
+            REGISTRY_RESOLVE_KEY_SUBJECT,
+            cb=self._instrument_handler("resolve_key", self._on_resolve_key),
+        )
+        await self._nc.subscribe(REGISTRY_SEARCH_SUBJECT, cb=self._instrument_handler("search", self._on_search))
+        await self._nc.subscribe(REGISTRY_PROFILE_SUBJECT, cb=self._instrument_handler("profile", self._on_profile))
+        await self._nc.subscribe(
+            REGISTRY_THREAD_STATUS_SUBJECT,
+            cb=self._instrument_handler("thread_status", self._on_thread_status),
+        )
+        await self._nc.subscribe(
+            REGISTRY_THREAD_LIST_SUBJECT,
+            cb=self._instrument_handler("thread_list", self._on_thread_list),
+        )
+        await self._nc.subscribe(
+            REGISTRY_THREAD_MESSAGES_SUBJECT,
+            cb=self._instrument_handler("thread_messages", self._on_thread_messages),
+        )
+        await self._nc.subscribe(
+            REGISTRY_MESSAGE_SEARCH_SUBJECT,
+            cb=self._instrument_handler("message_search", self._on_message_search),
+        )
+        await self._nc.subscribe(
+            REGISTRY_METRICS_SUBJECT,
+            cb=self._instrument_handler("metrics", self._on_metrics),
+        )
+        await self._nc.subscribe(
+            "account.*.inbox",
+            cb=self._instrument_handler("account_message", self._on_account_message),
+        )
+        await self._nc.subscribe(
+            "agent.capability.*",
+            cb=self._instrument_handler("account_message", self._on_account_message),
+        )
+        await self._nc.subscribe(
+            "_INBOX.>",
+            cb=self._instrument_handler("account_message", self._on_account_message),
+        )
 
         self._gc_task = asyncio.create_task(self._gc_loop(), name="agentnet-registry-gc")
         print(
@@ -1019,6 +1088,7 @@ class RegistryService:
             f"ttl={self.ttl_seconds}s heartbeat={self.heartbeat_interval_seconds}s "
             f"thread_soft={self.thread_soft_limit_tokens} thread_hard={self.thread_hard_limit_tokens} "
             f"thread_keep_tail={self.thread_keep_tail_messages} "
+            f"db_write_batch={'enabled' if self._db_write_queue is not None else 'disabled'} "
             f"db={'enabled' if self._store else 'disabled'} "
             f"dev_auth={'enabled' if self.dev_auth_enabled else 'disabled'}"
         )
@@ -1036,8 +1106,178 @@ class RegistryService:
             await self._nc.drain()
         self._nc = None
 
+        await self._stop_db_writer()
+
         if self._store is not None:
             await self._store.stop()
+
+    def _instrument_handler(
+        self,
+        name: str,
+        handler: Callable[[Msg], Awaitable[None]],
+    ) -> Callable[[Msg], Awaitable[None]]:
+        async def wrapped(msg: Msg) -> None:
+            started = time.perf_counter()
+            self._handler_calls[name] += 1
+            try:
+                await handler(msg)
+            except Exception:
+                self._handler_errors[name] += 1
+                raise
+            finally:
+                self._record_latency(f"handler.{name}", (time.perf_counter() - started) * 1000.0)
+
+        return wrapped
+
+    @staticmethod
+    def _percentile(samples: list[float], percentile: float) -> float:
+        if not samples:
+            return 0.0
+        if percentile <= 0:
+            return samples[0]
+        if percentile >= 100:
+            return samples[-1]
+        idx = int(round((percentile / 100.0) * (len(samples) - 1)))
+        idx = max(0, min(idx, len(samples) - 1))
+        return samples[idx]
+
+    def _record_latency(self, metric_name: str, elapsed_ms: float) -> None:
+        self._latency_samples[metric_name].append(max(0.0, float(elapsed_ms)))
+
+    def _latency_stats(self, metric_name: str) -> dict[str, float | int]:
+        values = list(self._latency_samples.get(metric_name, ()))
+        if not values:
+            return {"count": 0, "p50": 0.0, "p95": 0.0, "p99": 0.0}
+        values.sort()
+        return {
+            "count": len(values),
+            "p50": round(self._percentile(values, 50), 2),
+            "p95": round(self._percentile(values, 95), 2),
+            "p99": round(self._percentile(values, 99), 2),
+        }
+
+    def _metrics_snapshot(self) -> dict[str, Any]:
+        latency_ms: dict[str, dict[str, float | int]] = {}
+        for metric_name in sorted(self._latency_samples.keys()):
+            latency_ms[metric_name] = self._latency_stats(metric_name)
+
+        handlers: dict[str, dict[str, int]] = {}
+        for name in sorted(set(self._handler_calls.keys()) | set(self._handler_errors.keys())):
+            handlers[name] = {
+                "calls": int(self._handler_calls.get(name, 0)),
+                "errors": int(self._handler_errors.get(name, 0)),
+            }
+
+        return {
+            "generated_at": utc_now_iso(),
+            "server_id": self.server_id,
+            "window_size": self._metrics_window_size,
+            "store_enabled": self._store is not None,
+            "db_write_queue": {
+                "enabled": self._db_write_queue is not None,
+                "size": self._db_write_queue.qsize() if self._db_write_queue is not None else 0,
+                "max": self.db_write_queue_max,
+                "batch_size": self.db_write_batch_size,
+                "flush_ms": round(self.db_write_flush_seconds * 1000.0, 2),
+                "overflow_count": self._db_write_queue_overflow_count,
+            },
+            "latency_ms": latency_ms,
+            "handlers": handlers,
+        }
+
+    async def _stop_db_writer(self) -> None:
+        queue = self._db_write_queue
+        task = self._db_write_worker_task
+        if queue is None or task is None:
+            self._db_write_queue = None
+            self._db_write_worker_task = None
+            return
+        try:
+            await queue.put(None)
+            await task
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed stopping DB write worker")
+        finally:
+            self._db_write_queue = None
+            self._db_write_worker_task = None
+
+    async def _enqueue_db_write(self, message: AgentMessage, received_at: datetime) -> None:
+        if self._store is None:
+            return
+        queue = self._db_write_queue
+        if queue is None:
+            started = time.perf_counter()
+            await self._store.persist_message(message, received_at=received_at)
+            self._record_latency("db.persist_message_inline", (time.perf_counter() - started) * 1000.0)
+            return
+        try:
+            queue.put_nowait((message, received_at))
+        except asyncio.QueueFull:
+            self._db_write_queue_overflow_count += 1
+            started = time.perf_counter()
+            await self._store.persist_message(message, received_at=received_at)
+            self._record_latency("db.persist_message_inline", (time.perf_counter() - started) * 1000.0)
+
+    async def _persist_db_batch(self, batch: list[tuple[AgentMessage, datetime]]) -> None:
+        if self._store is None or not batch:
+            return
+        started = time.perf_counter()
+        try:
+            await self._store.persist_messages_batch(batch)
+            self._record_latency("db.persist_batch", (time.perf_counter() - started) * 1000.0)
+            return
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed persisting DB batch size=%s; retrying per-message", len(batch))
+            self._record_latency("db.persist_batch_failed", (time.perf_counter() - started) * 1000.0)
+
+        for message, received_at in batch:
+            single_started = time.perf_counter()
+            try:
+                await self._store.persist_message(message, received_at=received_at)
+                self._record_latency("db.persist_message_fallback", (time.perf_counter() - single_started) * 1000.0)
+            except Exception:  # noqa: BLE001
+                self.logger.exception("Failed fallback message persist message_id=%s", message.message_id)
+                self._record_latency("db.persist_message_fallback_failed", (time.perf_counter() - single_started) * 1000.0)
+
+    async def _db_write_loop(self) -> None:
+        queue = self._db_write_queue
+        if queue is None:
+            return
+        stop_after_flush = False
+        while True:
+            item = await queue.get()
+            if item is None:
+                queue.task_done()
+                break
+            batch: list[tuple[AgentMessage, datetime]] = [item]
+            deadline = time.monotonic() + self.db_write_flush_seconds
+            while len(batch) < self.db_write_batch_size:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    next_item = await asyncio.wait_for(queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                if next_item is None:
+                    queue.task_done()
+                    stop_after_flush = True
+                    break
+                batch.append(next_item)
+            await self._persist_db_batch(batch)
+            latest_by_thread: dict[str, AgentMessage] = {}
+            for message, _ in batch:
+                thread_id = str(message.thread_id or "").strip()
+                if thread_id:
+                    latest_by_thread[thread_id] = message
+            compaction_started = time.perf_counter()
+            for message in latest_by_thread.values():
+                await self._maybe_emit_compaction_event(trigger_message=message)
+            self._record_latency("compaction.maybe_emit", (time.perf_counter() - compaction_started) * 1000.0)
+            for _ in batch:
+                queue.task_done()
+            if stop_after_flush:
+                break
 
     async def _on_register(self, msg: Msg) -> None:
         if not msg.reply or not self._nc:
@@ -1554,6 +1794,11 @@ class RegistryService:
             ),
         )
 
+    async def _on_metrics(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        await self._nc.publish(msg.reply, encode_json(self._metrics_snapshot()))
+
     async def _on_account_message(self, msg: Msg) -> None:
         try:
             data = decode_json(msg.data)
@@ -1570,14 +1815,20 @@ class RegistryService:
         if not message.thread_id:
             message.thread_id = f"thread_{(message.trace_id or message.message_id).lower()}"
         if self._store is not None:
+            enqueue_started = time.perf_counter()
             try:
-                await self._store.persist_message(message, received_at=_utc_now())
+                await self._enqueue_db_write(message, received_at=_utc_now())
             except Exception:  # noqa: BLE001
-                self.logger.exception("Failed persisting message message_id=%s", message.message_id)
-            await self._maybe_emit_compaction_event(trigger_message=message)
+                self.logger.exception("Failed enqueueing message write message_id=%s", message.message_id)
+            finally:
+                self._record_latency("db.enqueue_message", (time.perf_counter() - enqueue_started) * 1000.0)
             return
+        local_persist_started = time.perf_counter()
         self._persist_message_local(message)
+        self._record_latency("local.persist_message", (time.perf_counter() - local_persist_started) * 1000.0)
+        compaction_started = time.perf_counter()
         await self._maybe_emit_compaction_event(trigger_message=message)
+        self._record_latency("compaction.maybe_emit", (time.perf_counter() - compaction_started) * 1000.0)
 
     async def _gc_loop(self) -> None:
         while True:
@@ -2404,6 +2655,10 @@ async def amain() -> None:
     dev_auth_nonce_ttl_seconds = float(os.getenv("DEV_AUTH_NONCE_TTL_SECONDS", "300"))
     compaction_event_enabled = parse_bool(os.getenv("THREAD_COMPACTION_EVENT_ENABLED"), default=True)
     compaction_event_cooldown_seconds = float(os.getenv("THREAD_COMPACTION_EVENT_COOLDOWN_SECONDS", "120"))
+    db_write_batch_enabled = parse_bool(os.getenv("DB_WRITE_BATCH_ENABLED"), default=True)
+    db_write_batch_size = int(os.getenv("DB_WRITE_BATCH_SIZE", "64"))
+    db_write_flush_ms = float(os.getenv("DB_WRITE_FLUSH_MS", "40"))
+    db_write_queue_max = int(os.getenv("DB_WRITE_QUEUE_MAX", "10000"))
 
     service = RegistryService(
         nats_url=nats_url,
@@ -2422,6 +2677,10 @@ async def amain() -> None:
         dev_auth_nonce_ttl_seconds=dev_auth_nonce_ttl_seconds,
         compaction_event_enabled=compaction_event_enabled,
         compaction_event_cooldown_seconds=compaction_event_cooldown_seconds,
+        db_write_batch_enabled=db_write_batch_enabled,
+        db_write_batch_size=db_write_batch_size,
+        db_write_flush_ms=db_write_flush_ms,
+        db_write_queue_max=db_write_queue_max,
     )
     await service.start()
 
