@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
 import sys
 from pathlib import Path
@@ -35,6 +36,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 async def amain() -> int:
+    if os.getenv("ALLOW_LEGACY_AGENTS", "0") != "1":
+        print("[moved] Agent demo runtime has moved to: realm-agents-playground")
+        print("This repository is network-focused.")
+        print("Temporary override (migration window only):")
+        print("  ALLOW_LEGACY_AGENTS=1 python agents/agent_mesh_trio.py --config agents/config/mesh_agents.yaml")
+        return 2
+
     args = _build_parser().parse_args()
     cfg = load_mesh_config(args.config)
     only = {item.strip() for item in args.only if item.strip()}

@@ -30,6 +30,7 @@ services:
       NATS_URL: nats://agentnet_secret_token@nats:4222
       DATABASE_URL: ${DATABASE_URL:-postgresql://agentnet:change_me_local@postgres:5432/agentnet}
       SESSION_RETENTION_DAYS: "14"
+      THREAD_RETENTION_DAYS: "${THREAD_RETENTION_DAYS:-30}"
       AGENT_TTL_SECONDS: "40"
       HEARTBEAT_INTERVAL_SECONDS: "12"
       GC_INTERVAL_SECONDS: "5"

@@ -946,6 +946,43 @@ class PostgresSessionStore:
             cutoff,
         )
 
+    async def prune_old_threads(self, now: datetime, *, retention_days: float, batch_size: int = 500) -> tuple[int, int]:
+        if self._pool is None:
+            return 0, 0
+        cutoff = now - timedelta(days=max(1.0, float(retention_days)))
+        safe_batch = max(1, int(batch_size))
+        row = await self._pool.fetchrow(
+            """
+            WITH stale_threads AS (
+                SELECT thread_id
+                FROM agent_threads
+                WHERE COALESCE(last_message_at, updated_at, created_at) < $1
+                ORDER BY COALESCE(last_message_at, updated_at, created_at) ASC
+                LIMIT $2
+            ),
+            deleted_messages AS (
+                DELETE FROM agent_messages m
+                USING stale_threads s
+                WHERE m.thread_id = s.thread_id
+                RETURNING 1
+            ),
+            deleted_threads AS (
+                DELETE FROM agent_threads t
+                USING stale_threads s
+                WHERE t.thread_id = s.thread_id
+                RETURNING 1
+            )
+            SELECT
+                COALESCE((SELECT COUNT(*) FROM deleted_threads), 0) AS threads_deleted,
+                COALESCE((SELECT COUNT(*) FROM deleted_messages), 0) AS messages_deleted
+            """,
+            cutoff,
+            safe_batch,
+        )
+        if row is None:
+            return 0, 0
+        return int(row["threads_deleted"] or 0), int(row["messages_deleted"] or 0)
+
 
 class RegistryService:
     def __init__(
@@ -961,6 +998,7 @@ class RegistryService:
         server_id: str = "registry",
         database_url: str | None = None,
         session_retention_days: float = 14.0,
+        thread_retention_days: float = 30.0,
         dev_auth_enabled: bool = False,
         dev_auth_max_skew_seconds: float = 120.0,
         dev_auth_nonce_ttl_seconds: float = 300.0,
@@ -981,6 +1019,7 @@ class RegistryService:
         self.token_estimate_chars_per_token = max(1.0, float(token_estimate_chars_per_token))
         self.server_id = server_id
         self.logger = logging.getLogger(f"agentnet.registry.{server_id}")
+        self.thread_retention_days = max(1.0, float(thread_retention_days))
         self.dev_auth_enabled = bool(dev_auth_enabled)
         self.dev_auth_max_skew_seconds = max(1.0, dev_auth_max_skew_seconds)
         self.dev_auth_nonce_ttl_seconds = max(5.0, dev_auth_nonce_ttl_seconds)
@@ -2480,12 +2519,63 @@ class RegistryService:
             self.logger.exception("Failed persisting offline session session_tag=%s", session_tag)
 
     async def _prune_persisted_sessions(self) -> None:
-        if self._store is None:
+        now = _utc_now()
+        if self._store is not None:
+            try:
+                await self._store.prune_offline(now=now)
+            except Exception:  # noqa: BLE001
+                self.logger.exception("Failed pruning offline session history")
+            try:
+                threads_deleted, messages_deleted = await self._store.prune_old_threads(
+                    now=now,
+                    retention_days=self.thread_retention_days,
+                )
+                if threads_deleted or messages_deleted:
+                    self.logger.info(
+                        "pruned stale thread data threads_deleted=%s messages_deleted=%s retention_days=%s",
+                        threads_deleted,
+                        messages_deleted,
+                        self.thread_retention_days,
+                    )
+            except Exception:  # noqa: BLE001
+                self.logger.exception("Failed pruning stale thread/message data")
             return
-        try:
-            await self._store.prune_offline(now=_utc_now())
-        except Exception:  # noqa: BLE001
-            self.logger.exception("Failed pruning offline session history")
+        self._prune_local_thread_data(now=now)
+
+    def _prune_local_thread_data(self, now: datetime) -> None:
+        cutoff = now - timedelta(days=self.thread_retention_days)
+        stale_thread_ids: list[str] = []
+        for thread_id, thread in self._local_threads.items():
+            last_activity_raw = str(
+                thread.get("last_message_at")
+                or thread.get("updated_at")
+                or thread.get("created_at")
+                or ""
+            )
+            last_activity = parse_iso_utc(last_activity_raw)
+            if last_activity is None:
+                continue
+            if last_activity < cutoff:
+                stale_thread_ids.append(thread_id)
+        if not stale_thread_ids:
+            return
+        stale_set = set(stale_thread_ids)
+        for thread_id in stale_thread_ids:
+            self._local_threads.pop(thread_id, None)
+            self._compaction_event_state.pop(thread_id, None)
+        stale_message_ids = [
+            message_id
+            for message_id, message in self._local_messages.items()
+            if str(message.get("thread_id") or "") in stale_set
+        ]
+        for message_id in stale_message_ids:
+            self._local_messages.pop(message_id, None)
+        self.logger.info(
+            "pruned local stale thread data threads_deleted=%s messages_deleted=%s retention_days=%s",
+            len(stale_thread_ids),
+            len(stale_message_ids),
+            self.thread_retention_days,
+        )
 
     @staticmethod
     def _is_compaction_event_payload(payload: Any) -> bool:
@@ -2650,6 +2740,7 @@ async def amain() -> None:
     server_id = os.getenv("REGISTRY_SERVER_ID", "registry")
     database_url = os.getenv("DATABASE_URL")
     retention_days = float(os.getenv("SESSION_RETENTION_DAYS", "14"))
+    thread_retention_days = float(os.getenv("THREAD_RETENTION_DAYS", "30"))
     dev_auth_enabled = parse_bool(os.getenv("DEV_AUTH"), default=False)
     dev_auth_max_skew_seconds = float(os.getenv("DEV_AUTH_MAX_SKEW_SECONDS", "120"))
     dev_auth_nonce_ttl_seconds = float(os.getenv("DEV_AUTH_NONCE_TTL_SECONDS", "300"))
@@ -2672,6 +2763,7 @@ async def amain() -> None:
         server_id=server_id,
         database_url=database_url,
         session_retention_days=retention_days,
+        thread_retention_days=thread_retention_days,
         dev_auth_enabled=dev_auth_enabled,
         dev_auth_max_skew_seconds=dev_auth_max_skew_seconds,
         dev_auth_nonce_ttl_seconds=dev_auth_nonce_ttl_seconds,

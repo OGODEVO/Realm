@@ -2,6 +2,21 @@
 
 `agentnet` is a lightweight Python package that lets agents discover each other and exchange direct messages over NATS.
 
+## Important Scope Update
+
+Agent demo/runtime code has been moved out of this repository to a dedicated playground repo:
+
+- `realm-agents-playground` (external repo)
+
+This repository now focuses on network infrastructure only:
+
+- `src/agentnet`
+- `services/registry`
+- `docker`
+- network/SDK docs
+
+Legacy agent entrypoints are temporarily kept as compatibility stubs and print a "moved" notice.
+
 Network operator reference: [`NETWORK_CLI_GUIDE.md`](NETWORK_CLI_GUIDE.md)
 UI integration reference: [`UI_BACKEND_MAPPING.md`](UI_BACKEND_MAPPING.md)
 
@@ -250,7 +265,10 @@ Registry persists account metadata into `agent_accounts` and session metadata in
 - `status`
 - `metadata` (JSONB)
 
-Retention is controlled by `SESSION_RETENTION_DAYS` (default: `14`). Offline sessions older than retention are pruned.
+Retention controls:
+
+- `SESSION_RETENTION_DAYS` (default: `14`): offline sessions older than retention are pruned.
+- `THREAD_RETENTION_DAYS` (default: `30`): stale threads (and their messages) older than retention are pruned by registry GC.
 
 Thread/message persistence:
 

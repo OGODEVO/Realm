@@ -1,4 +1,5 @@
 import {
+  type ConnectionOptions,
   JSONCodec,
   type Msg,
   type NatsConnection,
@@ -88,7 +89,28 @@ export class AgentNetClient {
     if (this.nc && !this.nc.isClosed()) {
       return;
     }
-    this.nc = await connect({ servers: this.opts.natsUrl, name: `agentnet-ts-${this.opts.agentId ?? "client"}` });
+
+    const connection: ConnectionOptions = {
+      servers: this.opts.natsUrl,
+      name: `agentnet-ts-${this.opts.agentId ?? "client"}`,
+    };
+
+    // Normalize token-only URL auth (nats://<token>@host:port) into explicit token option.
+    // nats.js does not treat URL username as auth token for token-auth servers.
+    try {
+      const parsed = new URL(this.opts.natsUrl);
+      if (parsed.username && !parsed.password) {
+        const token = decodeURIComponent(parsed.username);
+        parsed.username = "";
+        parsed.password = "";
+        connection.servers = parsed.toString();
+        connection.token = token;
+      }
+    } catch {
+      // Keep raw URL if parsing fails.
+    }
+
+    this.nc = await connect(connection);
   }
 
   async start(): Promise<RegisterResponse> {
