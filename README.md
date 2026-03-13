@@ -41,7 +41,7 @@ UI integration reference: [`UI_BACKEND_MAPPING.md`](UI_BACKEND_MAPPING.md)
 
 ## Quickstart
 
-### 1) Install
+### 1) Install.
 
 ```bash
 pip install agentnet
