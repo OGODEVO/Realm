@@ -196,7 +196,7 @@ npm run build
 From your other TS repo (local path install):
 
 ```bash
-npm install /Users/klyexy/Documents/realm/ts-sdk/agentnet-sdk
+npm install ../Realm/ts-sdk/agentnet-sdk
 ```
 
 ## LLM prompt seed (for coding assistant in your TS repo)

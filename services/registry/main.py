@@ -21,6 +21,14 @@ from nats.aio.msg import Msg
 
 from agentnet.config import DEFAULT_REGISTRY_SERVICE_NATS_URL
 from agentnet.dev_auth import DEV_AUTH_SCHEME, parse_bool, parse_iso_utc, verify_claims
+from agentnet.AgentNetLog import (
+    agentnet_logs_enabled,
+    emit_agentnet_log,
+    format_actor,
+    format_agent_roster_entry,
+    format_capabilities,
+    format_thread,
+)
 from agentnet.schema import AgentInfo, AgentMessage
 from agentnet.subjects import (
     REGISTRY_GOODBYE_SUBJECT,
@@ -1050,6 +1058,7 @@ class RegistryService:
         )
         self._handler_calls: dict[str, int] = defaultdict(int)
         self._handler_errors: dict[str, int] = defaultdict(int)
+        self._agentnet_logs_enabled = agentnet_logs_enabled()
         self._store = (
             PostgresSessionStore(
                 database_url,
@@ -1122,6 +1131,7 @@ class RegistryService:
         )
 
         self._gc_task = asyncio.create_task(self._gc_loop(), name="agentnet-registry-gc")
+        emit_agentnet_log("Registry online", enabled=self._agentnet_logs_enabled)
         print(
             f"registry ready: nats={self.nats_url} server_id={self.server_id} "
             f"ttl={self.ttl_seconds}s heartbeat={self.heartbeat_interval_seconds}s "
@@ -1365,6 +1375,11 @@ class RegistryService:
         self._sessions[session_tag] = agent
         self._last_seen_by_session[session_tag] = time.monotonic()
         await self._persist_online(session_tag, agent, connected_at=now_dt, last_seen=now_dt)
+        emit_agentnet_log(
+            f"Agent registered: {format_agent_roster_entry(name=agent.name, username=agent.username, capabilities=agent.capabilities)}",
+            enabled=self._agentnet_logs_enabled,
+        )
+        self._agentnet_log_online_snapshot()
 
         await self._nc.publish(
             msg.reply,
@@ -1409,6 +1424,11 @@ class RegistryService:
             self._sessions[session_tag] = incoming
             self._last_seen_by_session[session_tag] = time.monotonic()
             await self._persist_online(session_tag, incoming, connected_at=now_dt, last_seen=now_dt)
+            emit_agentnet_log(
+                f"Agent restored: {format_agent_roster_entry(name=incoming.name, username=incoming.username, capabilities=incoming.capabilities)}",
+                enabled=self._agentnet_logs_enabled,
+            )
+            self._agentnet_log_online_snapshot()
             return
 
         if not incoming.account_id:
@@ -1433,9 +1453,15 @@ class RegistryService:
         if not session_tag:
             return
 
-        self._sessions.pop(session_tag, None)
+        departing = self._sessions.pop(session_tag, None)
         self._last_seen_by_session.pop(session_tag, None)
         await self._persist_offline(session_tag, disconnected_at=_utc_now())
+        if departing is not None:
+            emit_agentnet_log(
+                f"Agent disconnected: {self._presentation_agent_label(departing)}",
+                enabled=self._agentnet_logs_enabled,
+            )
+        self._agentnet_log_online_snapshot()
 
     async def _on_list(self, msg: Msg) -> None:
         if not msg.reply or not self._nc:
@@ -1853,6 +1879,7 @@ class RegistryService:
             return
         if not message.thread_id:
             message.thread_id = f"thread_{(message.trace_id or message.message_id).lower()}"
+        self._agentnet_log_message_route(message)
         if self._store is not None:
             enqueue_started = time.perf_counter()
             try:
@@ -1887,8 +1914,13 @@ class RegistryService:
         now_dt = _utc_now()
         for session_tag in stale_session_tags:
             self._last_seen_by_session.pop(session_tag, None)
-            self._sessions.pop(session_tag, None)
+            departing = self._sessions.pop(session_tag, None)
             await self._persist_offline(session_tag, disconnected_at=now_dt)
+            if departing is not None:
+                emit_agentnet_log(
+                    f"Agent disconnected: {self._presentation_agent_label(departing)}",
+                    enabled=self._agentnet_logs_enabled,
+                )
 
     async def _resolve_or_create_account(
         self,
@@ -2718,12 +2750,68 @@ class RegistryService:
                 to_account_id,
                 approx_tokens,
             )
+            emit_agentnet_log(
+                f"Compaction requested: thread={format_thread(thread_id)} -> {self._presentation_account_label(to_account_id)}",
+                enabled=self._agentnet_logs_enabled,
+            )
         except Exception:  # noqa: BLE001
             self.logger.exception(
                 "failed emitting compaction event thread_id=%s to_account_id=%s",
                 thread_id,
                 to_account_id,
             )
+
+    def _presentation_agent_label(self, agent: AgentInfo) -> str:
+        return format_actor(
+            name=agent.name,
+            username=agent.username,
+            account_id=agent.account_id,
+            fallback=agent.agent_id,
+        )
+
+    def _presentation_account_label(self, account_id: str | None, fallback: str | None = None) -> str:
+        normalized = str(account_id or "").strip()
+        if normalized:
+            for info in self._sessions.values():
+                if info.account_id == normalized:
+                    return self._presentation_agent_label(info)
+        return format_actor(account_id=normalized or None, fallback=fallback)
+
+    def _agentnet_log_online_snapshot(self) -> None:
+        if not self._agentnet_logs_enabled:
+            return
+        agents = sorted(
+            self._sessions.values(),
+            key=lambda item: ((item.username or item.agent_id or ""), item.session_tag or ""),
+        )
+        if not agents:
+            emit_agentnet_log("Online agents (0)", enabled=True)
+            return
+        emit_agentnet_log("Online agents:", enabled=True)
+        for agent in agents:
+            emit_agentnet_log(
+                f"- {format_agent_roster_entry(name=agent.name, username=agent.username, capabilities=agent.capabilities)}",
+                enabled=True,
+            )
+
+    def _agentnet_log_message_route(self, message: AgentMessage) -> None:
+        if not self._agentnet_logs_enabled:
+            return
+        kind = str(message.kind or "").strip().lower() or "direct"
+        if kind == "reply":
+            event = "Reply"
+        elif kind == "request":
+            event = "Request"
+        elif kind == "system":
+            event = "System"
+        else:
+            event = "Routing"
+        source = self._presentation_account_label(message.from_account_id, fallback=message.from_agent)
+        target = self._presentation_account_label(message.to_account_id, fallback=message.to_agent)
+        emit_agentnet_log(
+            f"{event}: {source} -> {target}",
+            enabled=True,
+        )
 
 
 async def amain() -> None:

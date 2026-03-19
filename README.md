@@ -36,6 +36,7 @@ Canonical SDK bridge doc for external agent repos: [`BUILD_AGENT_BRIDGE_IN_15_MI
 - Optional idempotency keys (`idempotency_key`) to suppress duplicate logical operations
 - Delivery receipts with sender retry policy
 - Async-first API for scripts and long-running workers
+- Local blob store helpers for file/image references (`blob_ref` payloads over AgentNet)
 - Bounded in-process concurrency (worker cap + pending queue cap)
 - Safety guardrails: TTL checks, dedupe, rate limiting, work timeouts, circuit breaker
 - Durable metadata in Postgres (`agent_accounts`, `agent_sessions`, `agent_threads`, `agent_messages`)
@@ -135,6 +136,22 @@ LLM local tool wrappers can directly call:
 - `sdk.get_thread_messages(thread_id, limit=..., cursor=...)`
 - `sdk.search_messages(...)`
 - `sdk.thread_status(thread_id)`
+
+Blob/file helpers are available for local integrations:
+
+- `sdk.put_blob_bytes(...)`
+- `sdk.put_blob_file(...)`
+- `sdk.get_blob_bytes(blob_id)`
+- `sdk.get_blob_text(blob_id)`
+- `sdk.head_blob(blob_id)`
+- `sdk.send_blob_ref(to, blob, thread_id=...)`
+
+Blob references travel as normal message payloads:
+
+```python
+blob = sdk.put_blob_file("/tmp/chart.png")
+await sdk.send_blob_ref("@vision_agent", blob, thread_id="media_ops_1")
+```
 
 Under the hood this publishes to:
 
@@ -533,7 +550,7 @@ Files:
 Run:
 
 ```bash
-cd /Users/klyexy/Documents/realm
+cd Realm
 source venv/bin/activate
 set -a
 source agents/.env

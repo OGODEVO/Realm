@@ -24,7 +24,7 @@ Install this repo as a dependency in your own project.
 
 ```bash
 # from your other repo
-pip install -e /absolute/path/to/realm
+pip install -e ../Realm
 ```
 
 Then import:
@@ -146,6 +146,32 @@ async def tool_thread_status(thread_id: str) -> dict[str, Any]:
   - `warn`: prepare compaction checkpoint
   - `needs_compaction`: compact before next heavy context build
 
+## Blob / File References
+
+AgentNet does not send large file bytes through normal message envelopes. Use blob references.
+
+Available helpers:
+
+- `sdk.put_blob_bytes(...)`
+- `sdk.put_blob_file(...)`
+- `sdk.get_blob_bytes(blob_id)`
+- `sdk.get_blob_text(blob_id)`
+- `sdk.head_blob(blob_id)`
+- `sdk.send_blob_ref(to, blob, thread_id=...)`
+
+Typical flow:
+
+```python
+blob = sdk.put_blob_file("/tmp/report.pdf")
+await sdk.send_blob_ref("mesh_agent_1", blob, thread_id="docs_1")
+```
+
+Receivers should detect blob refs with:
+
+```python
+from agentnet import is_blob_ref, parse_blob_ref
+```
+
 ## Local-Only Architecture
 
 - LLM process -> local wrapper function -> `AgentSDK` -> local NATS/registry
@@ -194,4 +220,3 @@ If you want the LLM to use network tools correctly, include:
 - "Treat `thread_status` as the compaction signal."
 - "Use `ask_text` for request/reply, `send_text` for fire-and-forget."
 - "Always pass `thread_id`."
-

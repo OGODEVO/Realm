@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
+from agentnet.blob import BlobRef, LocalBlobStore
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
 from agentnet.registry import get_registry_metrics, get_thread_status
@@ -165,6 +167,7 @@ class AgentWrapper:
         nats_url: str = DEFAULT_NATS_URL,
         metadata: dict[str, Any] | None = None,
         heartbeat_interval: float = 12.0,
+        blob_store_dir: str | None = None,
         **node_options: Any,
     ) -> None:
         self._node = AgentNode(
@@ -178,6 +181,7 @@ class AgentWrapper:
             heartbeat_interval=heartbeat_interval,
             **node_options,
         )
+        self._blob_store = LocalBlobStore(blob_store_dir)
 
     @property
     def node(self) -> AgentNode:
@@ -206,6 +210,71 @@ class AgentWrapper:
 
     async def close(self) -> None:
         await self._node.close()
+
+    def put_blob_bytes(
+        self,
+        raw: bytes,
+        *,
+        filename: str | None = None,
+        mime_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BlobRef:
+        return self._blob_store.put_bytes(raw, filename=filename, mime_type=mime_type, metadata=metadata)
+
+    def put_blob_file(
+        self,
+        path: str,
+        *,
+        filename: str | None = None,
+        mime_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BlobRef:
+        return self._blob_store.put_file(path, filename=filename, mime_type=mime_type, metadata=metadata)
+
+    def get_blob_bytes(self, blob_id: str) -> bytes:
+        return self._blob_store.get_bytes(blob_id)
+
+    def get_blob_text(self, blob_id: str, *, encoding: str = "utf-8") -> str:
+        return self._blob_store.get_text(blob_id, encoding=encoding)
+
+    def head_blob(self, blob_id: str) -> BlobRef | None:
+        return self._blob_store.head(blob_id)
+
+    def delete_blob(self, blob_id: str) -> bool:
+        return self._blob_store.delete(blob_id)
+
+    async def send_blob_ref(
+        self,
+        *,
+        blob: BlobRef,
+        to_account_id: str | None = None,
+        to_username: str | None = None,
+        to_capability: str | None = None,
+        kind: str = "direct",
+        ttl_ms: int | None = None,
+        trace_id: str | None = None,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> str:
+        return await self.send(
+            payload=blob.to_payload(),
+            to_account_id=to_account_id,
+            to_username=to_username,
+            to_capability=to_capability,
+            kind=kind,
+            ttl_ms=ttl_ms,
+            trace_id=trace_id,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
 
     async def resolve_username(self, username: str, timeout: float = 2.0) -> str:
         return await self._node.resolve_account_id_by_username(username, timeout=timeout)
@@ -543,6 +612,31 @@ class ThreadSession:
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
 
+    async def send_blob_ref(
+        self,
+        to: str,
+        blob: BlobRef,
+        *,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        parent = parent_message_id if parent_message_id is not None else self.parent_message_id
+        result = await self._sdk.send_blob_ref(
+            to,
+            blob,
+            thread_id=self.thread_id,
+            parent_message_id=parent,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        self.parent_message_id = result.message_id or self.parent_message_id
+        return result
+
     async def ask_json(
         self,
         to: str,
@@ -581,6 +675,7 @@ class AgentSDK:
         heartbeat_interval: float = 12.0,
         default_request_timeout: float = 60.0,
         default_thread_prefix: str = "thread_sdk",
+        blob_store_dir: str | None = None,
         **node_options: Any,
     ) -> None:
         self._node = AgentNode(
@@ -597,6 +692,7 @@ class AgentSDK:
         self.default_request_timeout = max(0.1, float(default_request_timeout))
         prefix = str(default_thread_prefix or "thread_sdk").strip()
         self.default_thread_prefix = prefix or "thread_sdk"
+        self._blob_store = LocalBlobStore(blob_store_dir)
 
     @property
     def node(self) -> AgentNode:
@@ -637,6 +733,61 @@ class AgentSDK:
 
     def thread(self, thread_id: str, parent_message_id: str | None = None) -> ThreadSession:
         return ThreadSession(self, thread_id=thread_id, parent_message_id=parent_message_id)
+
+    def put_blob_bytes(
+        self,
+        raw: bytes,
+        *,
+        filename: str | None = None,
+        mime_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BlobRef:
+        return self._blob_store.put_bytes(raw, filename=filename, mime_type=mime_type, metadata=metadata)
+
+    def put_blob_file(
+        self,
+        path: str | Path,
+        *,
+        filename: str | None = None,
+        mime_type: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> BlobRef:
+        return self._blob_store.put_file(path, filename=filename, mime_type=mime_type, metadata=metadata)
+
+    def get_blob_bytes(self, blob_id: str) -> bytes:
+        return self._blob_store.get_bytes(blob_id)
+
+    def get_blob_text(self, blob_id: str, *, encoding: str = "utf-8") -> str:
+        return self._blob_store.get_text(blob_id, encoding=encoding)
+
+    def head_blob(self, blob_id: str) -> BlobRef | None:
+        return self._blob_store.head(blob_id)
+
+    def delete_blob(self, blob_id: str) -> bool:
+        return self._blob_store.delete(blob_id)
+
+    async def send_blob_ref(
+        self,
+        to: str,
+        blob: BlobRef,
+        *,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        return await self.send_json(
+            to,
+            blob.to_payload(),
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
 
     async def list_online(self, timeout: float = 2.0) -> list[AgentInfo]:
         return await self._node.list_online_agents(timeout=timeout)

@@ -25,6 +25,11 @@ from agentnet.dev_auth import (
     sign_claims,
     verify_claims,
 )
+from agentnet.AgentNetLog import (
+    agentnet_logs_enabled,
+    emit_agentnet_log,
+    format_actor,
+)
 from agentnet.registry import (
     get_profile,
     get_profile_with_client,
@@ -161,6 +166,7 @@ class AgentNode:
         self._username_account_cache: dict[str, tuple[str, float]] = {}
         self._username_cache_hits = 0
         self._username_cache_misses = 0
+        self._agentnet_logs_enabled = agentnet_logs_enabled()
 
     @property
     def info(self) -> AgentInfo:
@@ -286,6 +292,10 @@ class AgentNode:
             elif self.capabilities:
                 self.logger.warning("Capabilities were provided but no message handler is set; subscriptions disabled.")
             await self._publish_hello()
+            emit_agentnet_log(
+                f"{format_actor(name=self.name, username=self.username, account_id=self.account_id, fallback=self.agent_id)} connected",
+                enabled=self._agentnet_logs_enabled,
+            )
             self._heartbeat_task = asyncio.create_task(
                 self._heartbeat_loop(),
                 name=f"agentnet-heartbeat-{self.agent_id}",
@@ -331,6 +341,10 @@ class AgentNode:
                 self.logger.exception("Failed publishing registry.goodbye")
             await nc.drain()
 
+        emit_agentnet_log(
+            f"{format_actor(name=self.name, username=self.username, account_id=self.account_id, fallback=self.agent_id)} disconnected",
+            enabled=self._agentnet_logs_enabled,
+        )
         self.logger.info("AgentNode shutdown metrics=%s", self.metrics_snapshot())
         for pending in self._pending_receipts.values():
             if not pending.done():
@@ -1096,6 +1110,12 @@ class AgentNode:
         if idempotency_scope:
             self._seen_idempotency_keys[idempotency_scope] = now + self.dedupe_ttl_seconds
         queue.put_nowait(message)
+        event_name = "Reply received" if str(message.kind or "").strip().lower() == "reply" else "Received"
+        emit_agentnet_log(
+            f"{event_name}: {message.from_agent or format_actor(account_id=message.from_account_id)} -> "
+            f"{format_actor(name=self.name, username=self.username, account_id=self.account_id, fallback=self.agent_id)}",
+            enabled=self._agentnet_logs_enabled,
+        )
         await self._emit_delivery_receipt(message=message, status="accepted")
 
     async def _worker_loop(self, worker_id: int) -> None:

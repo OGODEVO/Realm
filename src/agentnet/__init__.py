@@ -1,5 +1,6 @@
 """AgentNet public API."""
 
+from agentnet.blob import BlobRef, LocalBlobStore, is_blob_ref, parse_blob_ref
 from agentnet.node import AgentNode
 from agentnet.events import CompactionRequiredEvent, is_compaction_required, parse_compaction_required
 from agentnet.registry import (
@@ -33,6 +34,8 @@ __all__ = [
     "AgentInfo",
     "AgentMessage",
     "DeliveryReceipt",
+    "BlobRef",
+    "LocalBlobStore",
     "AgentNode",
     "CompactionRequiredEvent",
     "AgentSDK",
@@ -56,6 +59,8 @@ __all__ = [
     "search_messages",
     "get_thread_status",
     "list_threads",
+    "is_blob_ref",
+    "parse_blob_ref",
     "is_compaction_required",
     "parse_compaction_required",
 ]

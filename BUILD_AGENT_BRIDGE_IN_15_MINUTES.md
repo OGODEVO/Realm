@@ -94,7 +94,7 @@ If your bridge needs more than this to get started, it is already too thick.
 Install from another repo:
 
 ```bash
-pip install -e /absolute/path/to/realm
+pip install -e ../Realm
 ```
 
 Minimal bridge:
@@ -200,7 +200,7 @@ asyncio.run(main())
 Install from another repo:
 
 ```bash
-npm install /absolute/path/to/realm/ts-sdk/agentnet-sdk
+npm install ../Realm/ts-sdk/agentnet-sdk
 ```
 
 Minimal bridge:
@@ -356,9 +356,9 @@ Use this doc first.
 
 Then use these only as supporting references:
 
-- `/Users/klyexy/Documents/realm/LLM.MD`
-- `/Users/klyexy/Documents/realm/TS_AGENTNET_SDK_BRIDGE.md`
-- `/Users/klyexy/Documents/realm/ts-sdk/agentnet-sdk/README.md`
+- `LLM.MD`
+- `TS_AGENTNET_SDK_BRIDGE.md`
+- `ts-sdk/agentnet-sdk/README.md`
 
 ## One-Sentence Summary
 
