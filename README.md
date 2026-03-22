@@ -20,6 +20,7 @@ Legacy agent entrypoints are temporarily kept as compatibility stubs and print a
 Network operator reference: [`NETWORK_CLI_GUIDE.md`](NETWORK_CLI_GUIDE.md)
 UI integration reference: [`UI_BACKEND_MAPPING.md`](UI_BACKEND_MAPPING.md)
 Canonical SDK bridge doc for external agent repos: [`BUILD_AGENT_BRIDGE_IN_15_MINUTES.md`](BUILD_AGENT_BRIDGE_IN_15_MINUTES.md)
+Streaming/UI protocol reference: [`STREAMING_PROTOCOL.md`](STREAMING_PROTOCOL.md)
 
 ## Features
 

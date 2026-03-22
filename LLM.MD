@@ -220,3 +220,5 @@ If you want the LLM to use network tools correctly, include:
 - "Treat `thread_status` as the compaction signal."
 - "Use `ask_text` for request/reply, `send_text` for fire-and-forget."
 - "Always pass `thread_id`."
+
+For incremental UI output, use the stream protocol in `STREAMING_PROTOCOL.md` rather than inventing provider-specific chunk payloads.

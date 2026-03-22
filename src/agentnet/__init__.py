@@ -2,7 +2,20 @@
 
 from agentnet.blob import BlobRef, LocalBlobStore, is_blob_ref, parse_blob_ref
 from agentnet.node import AgentNode
-from agentnet.events import CompactionRequiredEvent, is_compaction_required, parse_compaction_required
+from agentnet.events import (
+    CompactionRequiredEvent,
+    StreamDeltaEvent,
+    StreamEndEvent,
+    StreamErrorEvent,
+    StreamStartEvent,
+    is_compaction_required,
+    is_stream_event,
+    parse_compaction_required,
+    parse_stream_delta,
+    parse_stream_end,
+    parse_stream_error,
+    parse_stream_start,
+)
 from agentnet.registry import (
     get_registry_metrics,
     get_profile,
@@ -38,6 +51,10 @@ __all__ = [
     "LocalBlobStore",
     "AgentNode",
     "CompactionRequiredEvent",
+    "StreamStartEvent",
+    "StreamDeltaEvent",
+    "StreamEndEvent",
+    "StreamErrorEvent",
     "AgentSDK",
     "ThreadSession",
     "SDKResult",
@@ -62,5 +79,10 @@ __all__ = [
     "is_blob_ref",
     "parse_blob_ref",
     "is_compaction_required",
+    "is_stream_event",
     "parse_compaction_required",
+    "parse_stream_start",
+    "parse_stream_delta",
+    "parse_stream_end",
+    "parse_stream_error",
 ]

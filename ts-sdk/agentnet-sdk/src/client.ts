@@ -38,6 +38,7 @@ import type {
   ThreadStatusOptions,
 } from "./types.js";
 import { AgentNetError } from "./types.js";
+import { LocalBlobStore, type BlobRef, isBlobRef, parseBlobRef } from "./blobStore.js";
 import { buildExpiryIso, clamp, newMessageId, normalizeUsername, nowIso, parseRoutingTarget } from "./utils.js";
 
 type ReceiptWaiter = {
@@ -58,6 +59,7 @@ export class AgentNetClient {
   private receiptsSub: Subscription | null = null;
   private receiptWaiters = new Map<string, ReceiptWaiter>();
   private inboxSubs: Subscription[] = [];
+  private blobStore?: LocalBlobStore;
 
   private readonly opts: Required<
     Pick<AgentNetClientOptions, "natsUrl" | "defaultTtlMs" | "defaultRequestTimeoutMs" | "defaultSchemaVersion">
@@ -426,6 +428,41 @@ export class AgentNetClient {
       }
     }
     throw new AgentNetError("delivery acknowledgement timed out", { code: "delivery_ack_timeout" });
+  }
+
+  private getBlobStore(): LocalBlobStore {
+    if (!this.blobStore) {
+      this.blobStore = new LocalBlobStore({});
+    }
+    return this.blobStore;
+  }
+
+  async putBlobBytes(bytes: Uint8Array, filename: string, mimeType?: string): Promise<BlobRef> {
+    return this.getBlobStore().putBlobBytes(bytes, filename, mimeType);
+  }
+
+  async putBlobFile(filePath: string): Promise<BlobRef> {
+    return this.getBlobStore().putBlobFile(filePath);
+  }
+
+  async getBlobBytes(blobId: string): Promise<Uint8Array> {
+    return this.getBlobStore().getBlobBytes(blobId);
+  }
+
+  async getBlobText(blobId: string): Promise<string> {
+    return this.getBlobStore().getBlobText(blobId);
+  }
+
+  async headBlob(blobId: string): Promise<BlobRef> {
+    return this.getBlobStore().headBlob(blobId);
+  }
+
+  async deleteBlob(blobId: string): Promise<void> {
+    return this.getBlobStore().deleteBlob(blobId);
+  }
+
+  async sendBlobRef(to: string, blob: BlobRef, options: SendOptions = {}): Promise<string> {
+    return this.send(to, blob, options);
   }
 
   async request(to: string, payload: unknown, options: RequestOptions = {}): Promise<AgentMessage> {

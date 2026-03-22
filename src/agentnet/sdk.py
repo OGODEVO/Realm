@@ -12,6 +12,7 @@ from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
 from agentnet.registry import get_registry_metrics, get_thread_status
 from agentnet.schema import AgentInfo, AgentMessage
+from agentnet.utils import utc_now_iso
 
 ReceiveHandler = Callable[[AgentMessage], Awaitable[None]]
 
@@ -637,6 +638,105 @@ class ThreadSession:
         self.parent_message_id = result.message_id or self.parent_message_id
         return result
 
+    async def send_stream_start(
+        self,
+        to: str,
+        stream_id: str,
+        *,
+        role: str = "assistant",
+        content_type: str = "text/plain",
+        metadata: dict[str, Any] | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        parent = parent_message_id if parent_message_id is not None else self.parent_message_id
+        result = await self._sdk.send_stream_start(
+            to,
+            stream_id,
+            thread_id=self.thread_id,
+            role=role,
+            content_type=content_type,
+            metadata=metadata,
+            parent_message_id=parent,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        self.parent_message_id = result.message_id or self.parent_message_id
+        return result
+
+    async def send_stream_delta(
+        self,
+        to: str,
+        stream_id: str,
+        delta: str,
+        *,
+        seq: int,
+        role: str = "assistant",
+        content_type: str = "text/plain",
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        parent = parent_message_id if parent_message_id is not None else self.parent_message_id
+        result = await self._sdk.send_stream_delta(
+            to,
+            stream_id,
+            delta,
+            seq=seq,
+            thread_id=self.thread_id,
+            role=role,
+            content_type=content_type,
+            parent_message_id=parent,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        self.parent_message_id = result.message_id or self.parent_message_id
+        return result
+
+    async def send_stream_end(
+        self,
+        to: str,
+        stream_id: str,
+        *,
+        seq: int,
+        text: str | None = None,
+        role: str = "assistant",
+        content_type: str = "text/plain",
+        metadata: dict[str, Any] | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        parent = parent_message_id if parent_message_id is not None else self.parent_message_id
+        result = await self._sdk.send_stream_end(
+            to,
+            stream_id,
+            seq=seq,
+            text=text,
+            thread_id=self.thread_id,
+            role=role,
+            content_type=content_type,
+            metadata=metadata,
+            parent_message_id=parent,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        self.parent_message_id = result.message_id or self.parent_message_id
+        return result
+
     async def ask_json(
         self,
         to: str,
@@ -781,6 +881,148 @@ class AgentSDK:
         return await self.send_json(
             to,
             blob.to_payload(),
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+
+    async def send_stream_start(
+        self,
+        to: str,
+        stream_id: str,
+        *,
+        thread_id: str | None = None,
+        role: str = "assistant",
+        content_type: str = "text/plain",
+        metadata: dict[str, Any] | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        payload = {
+            "type": "stream_start",
+            "stream_id": str(stream_id),
+            "role": str(role),
+            "content_type": str(content_type),
+            "started_at": utc_now_iso(),
+            "metadata": dict(metadata or {}),
+        }
+        return await self._send_stream_event(
+            to,
+            payload,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+
+    async def send_stream_delta(
+        self,
+        to: str,
+        stream_id: str,
+        delta: str,
+        *,
+        seq: int,
+        thread_id: str | None = None,
+        role: str = "assistant",
+        content_type: str = "text/plain",
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        payload = {
+            "type": "stream_delta",
+            "stream_id": str(stream_id),
+            "delta": str(delta),
+            "seq": max(0, int(seq)),
+            "role": str(role),
+            "content_type": str(content_type),
+        }
+        return await self._send_stream_event(
+            to,
+            payload,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+
+    async def send_stream_end(
+        self,
+        to: str,
+        stream_id: str,
+        *,
+        seq: int,
+        text: str | None = None,
+        thread_id: str | None = None,
+        role: str = "assistant",
+        content_type: str = "text/plain",
+        metadata: dict[str, Any] | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        payload = {
+            "type": "stream_end",
+            "stream_id": str(stream_id),
+            "seq": max(0, int(seq)),
+            "role": str(role),
+            "content_type": str(content_type),
+            "finished_at": utc_now_iso(),
+            "metadata": dict(metadata or {}),
+        }
+        if text is not None:
+            payload["text"] = str(text)
+        return await self._send_stream_event(
+            to,
+            payload,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+
+    async def send_stream_error(
+        self,
+        to: str,
+        stream_id: str,
+        error: str,
+        *,
+        seq: int = 0,
+        thread_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        payload = {
+            "type": "stream_error",
+            "stream_id": str(stream_id),
+            "error": str(error),
+            "seq": max(0, int(seq)),
+            "finished_at": utc_now_iso(),
+            "metadata": dict(metadata or {}),
+        }
+        return await self._send_stream_event(
+            to,
+            payload,
             thread_id=thread_id,
             parent_message_id=parent_message_id,
             idempotency_key=idempotency_key,
@@ -1050,6 +1292,71 @@ class AgentSDK:
                 retry_attempts=retry_attempts,
                 receipt_timeout=receipt_timeout,
             )
+        raise ValueError(f"unsupported target kind: {target_kind}")
+
+    async def _send_stream_event(
+        self,
+        to: str,
+        payload: dict[str, Any],
+        *,
+        thread_id: str | None,
+        parent_message_id: str | None,
+        idempotency_key: str | None,
+        require_delivery_ack: bool,
+        retry_attempts: int | None,
+        receipt_timeout: float | None,
+    ) -> SDKResult:
+        kind, value = _parse_target_value(to)
+        effective_thread_id = self._normalize_thread_id(thread_id)
+        message_id = await self._send_stream_by_target(
+            target_kind=kind,
+            target_value=value,
+            payload=payload,
+            thread_id=effective_thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        return SDKResult(
+            ok=True,
+            thread_id=effective_thread_id,
+            message_id=message_id,
+            parent_message_id=parent_message_id,
+            data=payload,
+            text=None,
+        )
+
+    async def _send_stream_by_target(
+        self,
+        *,
+        target_kind: str,
+        target_value: str,
+        payload: Any,
+        thread_id: str,
+        parent_message_id: str | None,
+        idempotency_key: str | None,
+        require_delivery_ack: bool,
+        retry_attempts: int | None,
+        receipt_timeout: float | None,
+    ) -> str:
+        send_kwargs = dict(
+            payload=payload,
+            kind="stream",
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        if target_kind == "username":
+            return await self._node.send_to_username(username=target_value, **send_kwargs)
+        if target_kind == "account":
+            return await self._node.send_to_account(to_account_id=target_value, **send_kwargs)
+        if target_kind == "capability":
+            return await self._node.send_to_capability(capability=target_value, **send_kwargs)
         raise ValueError(f"unsupported target kind: {target_kind}")
 
     async def _request_by_target(
