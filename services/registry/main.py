@@ -98,6 +98,33 @@ def _extract_checkpoint_end(payload: Any) -> int:
     return _coerce_non_negative_int(payload.get("covers_end"), default=0)
 
 
+def _is_checkpoint_payload(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("type") or "").strip().lower() == "checkpoint"
+
+
+def _compute_pending_messages(*, message_count: int, latest_checkpoint_end: int, last_message_is_checkpoint: bool) -> int:
+    pending_messages = max(0, message_count - latest_checkpoint_end)
+    if last_message_is_checkpoint and pending_messages > 0:
+        pending_messages -= 1
+    return pending_messages
+
+
+def _counts_toward_pending_tail(*, kind: Any) -> bool:
+    return str(kind or "").strip().lower() != "system"
+
+
+def _extract_pending_messages(thread: Mapping[str, Any]) -> int:
+    if "pending_raw_messages" in thread:
+        return _coerce_non_negative_int(thread.get("pending_raw_messages"))
+    return _compute_pending_messages(
+        message_count=_coerce_non_negative_int(thread.get("message_count")),
+        latest_checkpoint_end=_coerce_non_negative_int(thread.get("latest_checkpoint_end")),
+        last_message_is_checkpoint=bool(thread.get("_last_message_is_checkpoint")),
+    )
+
+
 def _classify_thread_status(approx_tokens: int, soft_limit_tokens: int, hard_limit_tokens: int) -> str:
     soft = max(1, soft_limit_tokens)
     hard = max(soft, hard_limit_tokens)
@@ -223,6 +250,52 @@ class PostgresSessionStore:
         await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS approx_tokens BIGINT NOT NULL DEFAULT 0")
         await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS latest_checkpoint_end BIGINT NOT NULL DEFAULT 0")
         await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ NULL")
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS last_message_is_checkpoint BOOLEAN NOT NULL DEFAULT FALSE")
+        await self._pool.execute("ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS pending_raw_messages BIGINT NOT NULL DEFAULT 0")
+        await self._pool.execute(
+            """
+            WITH ranked AS (
+                SELECT
+                    m.thread_id,
+                    ROW_NUMBER() OVER (PARTITION BY m.thread_id ORDER BY m.sent_at ASC, m.message_id ASC) AS ordinal,
+                    m.kind
+                FROM agent_messages AS m
+            ),
+            pending AS (
+                SELECT
+                    t.thread_id,
+                    COUNT(*) FILTER (
+                        WHERE r.ordinal > COALESCE(t.latest_checkpoint_end, 0)
+                          AND r.kind <> 'system'
+                    ) AS pending_raw_messages
+                FROM agent_threads AS t
+                LEFT JOIN ranked AS r ON r.thread_id = t.thread_id
+                GROUP BY t.thread_id
+            )
+            UPDATE agent_threads AS t
+            SET pending_raw_messages = COALESCE(p.pending_raw_messages, 0)
+            FROM pending AS p
+            WHERE t.thread_id = p.thread_id
+            """
+        )
+        await self._pool.execute(
+            """
+            WITH last_messages AS (
+                SELECT DISTINCT ON (m.thread_id)
+                    m.thread_id,
+                    CASE
+                        WHEN m.kind = 'system' AND COALESCE(m.payload->>'type', '') = 'checkpoint' THEN TRUE
+                        ELSE FALSE
+                    END AS last_message_is_checkpoint
+                FROM agent_messages AS m
+                ORDER BY m.thread_id, m.sent_at DESC, m.message_id DESC
+            )
+            UPDATE agent_threads AS t
+            SET last_message_is_checkpoint = COALESCE(l.last_message_is_checkpoint, FALSE)
+            FROM last_messages AS l
+            WHERE t.thread_id = l.thread_id
+            """
+        )
         await self._pool.execute(
             """
             CREATE TABLE IF NOT EXISTS agent_messages (
@@ -527,7 +600,9 @@ class PostgresSessionStore:
                 byte_count,
                 approx_tokens,
                 latest_checkpoint_end,
-                last_message_at
+                pending_raw_messages,
+                last_message_at,
+                last_message_is_checkpoint
             FROM agent_threads
             WHERE thread_id = $1
             """,
@@ -546,7 +621,9 @@ class PostgresSessionStore:
             "byte_count": _coerce_non_negative_int(row["byte_count"]),
             "approx_tokens": _coerce_non_negative_int(row["approx_tokens"]),
             "latest_checkpoint_end": _coerce_non_negative_int(row["latest_checkpoint_end"]),
+            "pending_raw_messages": _coerce_non_negative_int(row["pending_raw_messages"]),
             "last_message_at": _iso_utc(row["last_message_at"]) if row["last_message_at"] is not None else None,
+            "_last_message_is_checkpoint": bool(row["last_message_is_checkpoint"]),
         }
 
     async def list_threads(
@@ -573,7 +650,9 @@ class PostgresSessionStore:
                 byte_count,
                 approx_tokens,
                 latest_checkpoint_end,
-                last_message_at
+                pending_raw_messages,
+                last_message_at,
+                last_message_is_checkpoint
             FROM agent_threads
             WHERE
                 ($1 = '' OR thread_id ILIKE ('%' || $1 || '%'))
@@ -599,10 +678,32 @@ class PostgresSessionStore:
                     "byte_count": _coerce_non_negative_int(row["byte_count"]),
                     "approx_tokens": _coerce_non_negative_int(row["approx_tokens"]),
                     "latest_checkpoint_end": _coerce_non_negative_int(row["latest_checkpoint_end"]),
+                    "pending_raw_messages": _coerce_non_negative_int(row["pending_raw_messages"]),
                     "last_message_at": _iso_utc(row["last_message_at"]) if row["last_message_at"] is not None else None,
+                    "_last_message_is_checkpoint": bool(row["last_message_is_checkpoint"]),
                 }
             )
         return results
+
+    async def _count_pending_raw_messages_with_conn(self, conn: Any, *, thread_id: str, latest_checkpoint_end: int) -> int:
+        row = await conn.fetchrow(
+            """
+            WITH ranked AS (
+                SELECT
+                    ROW_NUMBER() OVER (ORDER BY sent_at ASC, message_id ASC) AS ordinal,
+                    kind
+                FROM agent_messages
+                WHERE thread_id = $1
+            )
+            SELECT COUNT(*) FILTER (WHERE ordinal > $2 AND kind <> 'system') AS pending_raw_messages
+            FROM ranked
+            """,
+            thread_id,
+            max(0, int(latest_checkpoint_end)),
+        )
+        if not row:
+            return 0
+        return _coerce_non_negative_int(row["pending_raw_messages"])
 
     @staticmethod
     def _row_to_message(row: Any) -> dict[str, Any]:
@@ -751,6 +852,8 @@ class PostgresSessionStore:
         payload_bytes = len(payload_json.encode("utf-8"))
         payload_tokens = _estimate_tokens(payload_bytes, self.token_estimate_chars_per_token)
         checkpoint_end = _extract_checkpoint_end(payload_value)
+        is_checkpoint_message = _is_checkpoint_payload(payload_value)
+        counts_toward_pending_tail = _counts_toward_pending_tail(kind=message.kind)
         metadata_payload = {
             "ttl_ms": message.ttl_ms,
             "expires_at": message.expires_at,
@@ -805,6 +908,23 @@ class PostgresSessionStore:
         )
         inserted = insert_result.endswith("1")
         if inserted:
+            pending_raw_messages = 0
+            if is_checkpoint_message:
+                current_checkpoint_end = await conn.fetchval(
+                    "SELECT COALESCE(latest_checkpoint_end, 0) FROM agent_threads WHERE thread_id = $1",
+                    thread_id,
+                )
+                effective_checkpoint_end = max(
+                    _coerce_non_negative_int(current_checkpoint_end),
+                    checkpoint_end,
+                )
+                pending_raw_messages = await self._count_pending_raw_messages_with_conn(
+                    conn,
+                    thread_id=thread_id,
+                    latest_checkpoint_end=effective_checkpoint_end,
+                )
+            elif counts_toward_pending_tail:
+                pending_raw_messages = 1
             await conn.execute(
                 """
                 UPDATE agent_threads
@@ -814,6 +934,11 @@ class PostgresSessionStore:
                     approx_tokens = COALESCE(approx_tokens, 0) + $4,
                     latest_checkpoint_end = GREATEST(COALESCE(latest_checkpoint_end, 0), $5),
                     last_message_at = GREATEST(COALESCE(last_message_at, $6), $6),
+                    last_message_is_checkpoint = $7,
+                    pending_raw_messages = CASE
+                        WHEN $7 THEN $8
+                        ELSE COALESCE(pending_raw_messages, 0) + $9
+                    END,
                     updated_at = GREATEST(updated_at, $6)
                 WHERE thread_id = $1
                 """,
@@ -823,6 +948,9 @@ class PostgresSessionStore:
                 payload_tokens,
                 checkpoint_end,
                 sent_at,
+                is_checkpoint_message,
+                pending_raw_messages,
+                1 if counts_toward_pending_tail else 0,
             )
         return inserted
 
@@ -1644,15 +1772,14 @@ class RegistryService:
             return
 
         approx_tokens = _coerce_non_negative_int(thread.get("approx_tokens"))
-        message_count = _coerce_non_negative_int(thread.get("message_count"))
-        latest_checkpoint_end = _coerce_non_negative_int(thread.get("latest_checkpoint_end"))
-        pending_messages = max(0, message_count - latest_checkpoint_end)
+        pending_messages = _extract_pending_messages(thread)
         if pending_messages <= self.thread_keep_tail_messages:
             status = "ok"
         else:
             status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
+        thread_response = {k: v for k, v in thread.items() if k != "_last_message_is_checkpoint"}
         response = {
-            **thread,
+            **thread_response,
             "status": status,
             "pending_messages": pending_messages,
             "soft_limit_tokens": soft_limit_tokens,
@@ -1726,16 +1853,15 @@ class RegistryService:
         results: list[dict[str, Any]] = []
         for item in threads:
             approx_tokens = _coerce_non_negative_int(item.get("approx_tokens"))
-            message_count = _coerce_non_negative_int(item.get("message_count"))
-            latest_checkpoint_end = _coerce_non_negative_int(item.get("latest_checkpoint_end"))
-            pending_messages = max(0, message_count - latest_checkpoint_end)
+            pending_messages = _extract_pending_messages(item)
             if pending_messages <= self.thread_keep_tail_messages:
                 status = "ok"
             else:
                 status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
+            item_response = {k: v for k, v in item.items() if k != "_last_message_is_checkpoint"}
             results.append(
                 {
-                    **item,
+                    **item_response,
                     "status": status,
                     "pending_messages": pending_messages,
                 }
@@ -2148,7 +2274,9 @@ class RegistryService:
             "byte_count": _coerce_non_negative_int(thread.get("byte_count")),
             "approx_tokens": _coerce_non_negative_int(thread.get("approx_tokens")),
             "latest_checkpoint_end": _coerce_non_negative_int(thread.get("latest_checkpoint_end")),
+            "pending_raw_messages": _coerce_non_negative_int(thread.get("pending_raw_messages")),
             "last_message_at": str(thread.get("last_message_at") or "") or None,
+            "_last_message_is_checkpoint": bool(thread.get("last_message_is_checkpoint")),
         }
 
     async def _list_threads(
@@ -2186,7 +2314,9 @@ class RegistryService:
                     "byte_count": _coerce_non_negative_int(thread.get("byte_count")),
                     "approx_tokens": _coerce_non_negative_int(thread.get("approx_tokens")),
                     "latest_checkpoint_end": _coerce_non_negative_int(thread.get("latest_checkpoint_end")),
+                    "pending_raw_messages": _coerce_non_negative_int(thread.get("pending_raw_messages")),
                     "last_message_at": str(thread.get("last_message_at") or "") or None,
+                    "_last_message_is_checkpoint": bool(thread.get("last_message_is_checkpoint")),
                 }
             )
         rows.sort(
@@ -2197,6 +2327,27 @@ class RegistryService:
             reverse=True,
         )
         return rows[:safe_limit]
+
+    def _recount_local_pending_raw_messages(self, *, thread_id: str, latest_checkpoint_end: int) -> int:
+        ranked_messages = sorted(
+            (
+                message
+                for message in self._local_messages.values()
+                if str(message.get("thread_id") or "") == thread_id
+            ),
+            key=lambda item: (
+                str(item.get("sent_at") or ""),
+                str(item.get("message_id") or ""),
+            ),
+        )
+        pending = 0
+        boundary = max(0, int(latest_checkpoint_end))
+        for index, message in enumerate(ranked_messages, start=1):
+            if index <= boundary:
+                continue
+            if _counts_toward_pending_tail(kind=message.get("kind")):
+                pending += 1
+        return pending
 
     async def _list_thread_messages(
         self,
@@ -2385,6 +2536,7 @@ class RegistryService:
         payload_bytes = len(payload_json.encode("utf-8"))
         payload_tokens = _estimate_tokens(payload_bytes, self.token_estimate_chars_per_token)
         checkpoint_end = _extract_checkpoint_end(payload_value)
+        is_checkpoint_message = _is_checkpoint_payload(payload_value)
         sent_at = str(message.sent_at or "").strip() or utc_now_iso()
         now_iso = utc_now_iso()
         if existing_thread is None:
@@ -2396,7 +2548,9 @@ class RegistryService:
                 "byte_count": 0,
                 "approx_tokens": 0,
                 "latest_checkpoint_end": 0,
+                "pending_raw_messages": 0,
                 "last_message_at": None,
+                "last_message_is_checkpoint": False,
                 "created_at": now_iso,
                 "updated_at": now_iso,
             }
@@ -2405,17 +2559,6 @@ class RegistryService:
             existing_thread["participants"] = sorted(participants)
             if not str(existing_thread.get("created_by_account_id") or "").strip():
                 existing_thread["created_by_account_id"] = message.from_account_id
-            existing_thread["updated_at"] = now_iso
-
-        if is_new_message:
-            existing_thread["message_count"] = _coerce_non_negative_int(existing_thread.get("message_count")) + 1
-            existing_thread["byte_count"] = _coerce_non_negative_int(existing_thread.get("byte_count")) + payload_bytes
-            existing_thread["approx_tokens"] = _coerce_non_negative_int(existing_thread.get("approx_tokens")) + payload_tokens
-            existing_thread["latest_checkpoint_end"] = max(
-                _coerce_non_negative_int(existing_thread.get("latest_checkpoint_end")),
-                checkpoint_end,
-            )
-            existing_thread["last_message_at"] = sent_at
             existing_thread["updated_at"] = now_iso
 
         self._local_messages[message.message_id] = {
@@ -2436,6 +2579,25 @@ class RegistryService:
             "byte_count": payload_bytes,
             "approx_tokens": payload_tokens,
         }
+
+        if is_new_message:
+            existing_thread["message_count"] = _coerce_non_negative_int(existing_thread.get("message_count")) + 1
+            existing_thread["byte_count"] = _coerce_non_negative_int(existing_thread.get("byte_count")) + payload_bytes
+            existing_thread["approx_tokens"] = _coerce_non_negative_int(existing_thread.get("approx_tokens")) + payload_tokens
+            existing_thread["latest_checkpoint_end"] = max(
+                _coerce_non_negative_int(existing_thread.get("latest_checkpoint_end")),
+                checkpoint_end,
+            )
+            existing_thread["last_message_at"] = sent_at
+            existing_thread["last_message_is_checkpoint"] = is_checkpoint_message
+            if is_checkpoint_message:
+                existing_thread["pending_raw_messages"] = self._recount_local_pending_raw_messages(
+                    thread_id=thread_id,
+                    latest_checkpoint_end=_coerce_non_negative_int(existing_thread.get("latest_checkpoint_end")),
+                )
+            elif _counts_toward_pending_tail(kind=message.kind):
+                existing_thread["pending_raw_messages"] = _coerce_non_negative_int(existing_thread.get("pending_raw_messages")) + 1
+            existing_thread["updated_at"] = now_iso
 
     async def _validate_register_auth(
         self,
@@ -2688,7 +2850,7 @@ class RegistryService:
             return
         latest_checkpoint_end = _coerce_non_negative_int(thread.get("latest_checkpoint_end"))
         message_count = _coerce_non_negative_int(thread.get("message_count"))
-        pending_messages = max(0, message_count - latest_checkpoint_end)
+        pending_messages = _extract_pending_messages(thread)
         if pending_messages <= self.thread_keep_tail_messages:
             self._compaction_event_state.pop(thread_id, None)
             return
