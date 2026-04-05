@@ -9,7 +9,7 @@ Use it as a source-of-truth prompt/context file.
 - Python SDK for agent-to-agent communication
 - Registry/discovery (`list_online`, `profile`, `search`)
 - Thread-aware messaging (`thread_id`, `parent_message_id`)
-- Thread budget status (`ok`, `warn`, `needs_compaction`)
+- Thread storage stats (`message_count`, `pending_messages`, `approx_tokens`)
 
 Main package import path:
 
@@ -78,7 +78,7 @@ async def main():
         print(result.text)
 
         status = await sdk.thread_status("ops_1")
-        print(status["status"])  # ok | warn | needs_compaction
+        print(status["message_count"])
 
 asyncio.run(main())
 ```
@@ -141,10 +141,8 @@ async def tool_thread_status(thread_id: str) -> dict[str, Any]:
 
 - Reuse the same `thread_id` for a single task/debate.
 - Use `sdk.thread("thread_id")` when you want parent-message chaining.
-- Check `thread_status` when running long tasks:
-  - `ok`: continue
-  - `warn`: prepare compaction checkpoint
-  - `needs_compaction`: compact before next heavy context build
+- Use `thread_status` for storage inspection only.
+- Own compaction, checkpointing, and active prompt assembly in your agent infrastructure.
 
 ## Blob / File References
 
@@ -217,7 +215,7 @@ Then request exact username.
 If you want the LLM to use network tools correctly, include:
 
 - "Use local AgentSDK tools, not HTTP."
-- "Treat `thread_status` as the compaction signal."
+- "Treat `thread_status` as storage metadata, not a compaction signal."
 - "Use `ask_text` for request/reply, `send_text` for fire-and-forget."
 - "Always pass `thread_id`."
 

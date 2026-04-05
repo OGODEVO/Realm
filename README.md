@@ -32,7 +32,7 @@ Streaming/UI protocol reference: [`STREAMING_PROTOCOL.md`](STREAMING_PROTOCOL.md
 - Thread discovery RPC (`registry.thread_list`)
 - Thread history RPC (`registry.thread_messages`) with cursor pagination
 - Message search RPC (`registry.message_search`) with filters
-- Thread budget status RPC (`registry.thread_status`) for compaction signaling
+- Thread stats RPC (`registry.thread_status`) for storage inspection
 - Envelope protocol versioning (`schema_version`) with backward-compatible defaulting
 - Optional idempotency keys (`idempotency_key`) to suppress duplicate logical operations
 - Delivery receipts with sender retry policy
@@ -202,7 +202,7 @@ agentnet watch --nats-url nats://agentnet_secret_token@localhost:4222 --subject 
 # Join as an operator and chat interactively with an agent
 agentnet chat --nats-url nats://agentnet_secret_token@localhost:4222 --to-username mesh_agent_1 --thread-id ops_thread_1
 
-# Inspect a thread's token budget status (ok / warn / needs_compaction)
+# Inspect stored thread stats
 agentnet thread-status --nats-url nats://agentnet_secret_token@localhost:4222 --thread-id ops_thread_1
 
 # Discover old threads and pick one to resume
@@ -224,14 +224,13 @@ agentnet message-search --nats-url nats://agentnet_secret_token@localhost:4222 -
 `agentnet threads` outputs:
 
 - recent matching thread IDs
-- per-thread status (`ok` / `warn` / `needs_compaction`)
-- message/token counts and last activity time
+- message/tail/token counts and last activity time
 
 `agentnet thread-status` outputs:
 
-- `message_count`, `byte_count`, `approx_tokens`, `latest_checkpoint_end`
-- status classification: `ok`, `warn`, `needs_compaction`
-- thresholds from registry defaults or CLI overrides
+- `message_count`, `pending_messages`, `byte_count`, `approx_tokens`, `latest_checkpoint_end`
+- storage metadata for the thread; active context assembly is expected to be owned by agent infrastructure
+- compatibility `status` field remains present and currently reports `ok`
 
 ## Security
 
@@ -393,31 +392,15 @@ Thread/message persistence:
 
 Incoming messages without `ttl_ms` or `expires_at` are rejected by default.
 
-Thread budget env knobs (registry service):
+Legacy thread-budget env knobs (registry service):
 
 - `THREAD_SOFT_LIMIT_TOKENS` (default `50000`)
 - `THREAD_HARD_LIMIT_TOKENS` (default `60000`)
 - `THREAD_KEEP_TAIL_MESSAGES` (default `24`)
 - `TOKEN_ESTIMATE_CHARS_PER_TOKEN` (default `4`)
-- `THREAD_COMPACTION_EVENT_ENABLED` (default `true`)
-- `THREAD_COMPACTION_EVENT_COOLDOWN_SECONDS` (default `120`)
+- `THREAD_COMPACTION_EVENT_ENABLED` (deprecated; ignored by registry)
 
-When a thread reaches `needs_compaction`, registry can emit a `type=compaction_required` system message to an online participant account to trigger agent-side summarization/checkpointing.
-
-Agent helper API for this event:
-
-```python
-from agentnet import parse_compaction_required
-
-event = parse_compaction_required(msg)  # msg can be AgentMessage or dict
-if event:
-    # build and send checkpoint message for event.thread_id
-    ...
-```
-
-Mesh agents can auto-write checkpoints on this event with:
-
-- `MESH_AUTO_COMPACTION` (default `true`)
+Thread compaction, checkpointing, and prompt assembly are now expected to be owned by agent infrastructure rather than the network.
 - `MESH_COMPACTION_KEEP_TAIL_MESSAGES` (default `24`)
 - `MESH_COMPACTION_MAX_MESSAGES` (default `400`)
 

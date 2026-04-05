@@ -125,16 +125,6 @@ def _extract_pending_messages(thread: Mapping[str, Any]) -> int:
     )
 
 
-def _classify_thread_status(approx_tokens: int, soft_limit_tokens: int, hard_limit_tokens: int) -> str:
-    soft = max(1, soft_limit_tokens)
-    hard = max(soft, hard_limit_tokens)
-    if approx_tokens >= hard:
-        return "needs_compaction"
-    if approx_tokens >= soft:
-        return "warn"
-    return "ok"
-
-
 def _encode_cursor(*, sent_at: datetime | str, message_id: str) -> str:
     if isinstance(sent_at, datetime):
         sent_at_value = _iso_utc(sent_at)
@@ -1138,7 +1128,7 @@ class RegistryService:
         dev_auth_enabled: bool = False,
         dev_auth_max_skew_seconds: float = 120.0,
         dev_auth_nonce_ttl_seconds: float = 300.0,
-        compaction_event_enabled: bool = True,
+        compaction_event_enabled: bool = False,
         compaction_event_cooldown_seconds: float = 120.0,
         db_write_batch_enabled: bool = True,
         db_write_batch_size: int = 64,
@@ -1176,7 +1166,6 @@ class RegistryService:
         self._local_threads: dict[str, dict[str, Any]] = {}
         self._local_messages: dict[str, dict[str, Any]] = {}
         self._seen_register_nonces: dict[str, float] = {}
-        self._compaction_event_state: dict[str, tuple[int, float]] = {}
         self._db_write_queue: asyncio.Queue[tuple[AgentMessage, datetime] | None] | None = None
         self._db_write_worker_task: asyncio.Task[None] | None = None
         self._db_write_queue_overflow_count = 0
@@ -1260,11 +1249,13 @@ class RegistryService:
 
         self._gc_task = asyncio.create_task(self._gc_loop(), name="agentnet-registry-gc")
         emit_agentnet_log("Registry online", enabled=self._agentnet_logs_enabled)
+        if self.compaction_event_enabled:
+            self.logger.warning(
+                "THREAD_COMPACTION_EVENT_ENABLED is deprecated; compaction is now expected to be owned by agent infrastructure"
+            )
         print(
             f"registry ready: nats={self.nats_url} server_id={self.server_id} "
             f"ttl={self.ttl_seconds}s heartbeat={self.heartbeat_interval_seconds}s "
-            f"thread_soft={self.thread_soft_limit_tokens} thread_hard={self.thread_hard_limit_tokens} "
-            f"thread_keep_tail={self.thread_keep_tail_messages} "
             f"db_write_batch={'enabled' if self._db_write_queue is not None else 'disabled'} "
             f"db={'enabled' if self._store else 'disabled'} "
             f"dev_auth={'enabled' if self.dev_auth_enabled else 'disabled'}"
@@ -1442,15 +1433,6 @@ class RegistryService:
                     break
                 batch.append(next_item)
             await self._persist_db_batch(batch)
-            latest_by_thread: dict[str, AgentMessage] = {}
-            for message, _ in batch:
-                thread_id = str(message.thread_id or "").strip()
-                if thread_id:
-                    latest_by_thread[thread_id] = message
-            compaction_started = time.perf_counter()
-            for message in latest_by_thread.values():
-                await self._maybe_emit_compaction_event(trigger_message=message)
-            self._record_latency("compaction.maybe_emit", (time.perf_counter() - compaction_started) * 1000.0)
             for _ in batch:
                 queue.task_done()
             if stop_after_flush:
@@ -1750,17 +1732,6 @@ class RegistryService:
             await self._nc.publish(msg.reply, encode_json({"error": "thread_id is required"}))
             return
 
-        soft_limit_tokens = _coerce_non_negative_int(
-            data.get("soft_limit_tokens"),
-            default=self.thread_soft_limit_tokens,
-        )
-        hard_limit_tokens = _coerce_non_negative_int(
-            data.get("hard_limit_tokens"),
-            default=self.thread_hard_limit_tokens,
-        )
-        soft_limit_tokens = max(1, soft_limit_tokens)
-        hard_limit_tokens = max(soft_limit_tokens, hard_limit_tokens)
-
         try:
             thread = await self._get_thread_status(thread_id)
         except Exception:  # noqa: BLE001
@@ -1771,21 +1742,14 @@ class RegistryService:
             await self._nc.publish(msg.reply, encode_json({"error": "not_found"}))
             return
 
-        approx_tokens = _coerce_non_negative_int(thread.get("approx_tokens"))
         pending_messages = _extract_pending_messages(thread)
-        if pending_messages <= self.thread_keep_tail_messages:
-            status = "ok"
-        else:
-            status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
         thread_response = {k: v for k, v in thread.items() if k != "_last_message_is_checkpoint"}
         response = {
             **thread_response,
-            "status": status,
+            "status": "ok",
             "pending_messages": pending_messages,
-            "soft_limit_tokens": soft_limit_tokens,
-            "hard_limit_tokens": hard_limit_tokens,
-            "thread_keep_tail_messages": self.thread_keep_tail_messages,
             "token_estimate_chars_per_token": self.token_estimate_chars_per_token,
+            "thread_management_owner": "agent_infra",
             "generated_at": utc_now_iso(),
         }
         await self._nc.publish(msg.reply, encode_json(response))
@@ -1828,17 +1792,6 @@ class RegistryService:
                 return
             participant_account_id = resolved[0]
 
-        soft_limit_tokens = _coerce_non_negative_int(
-            data.get("soft_limit_tokens"),
-            default=self.thread_soft_limit_tokens,
-        )
-        hard_limit_tokens = _coerce_non_negative_int(
-            data.get("hard_limit_tokens"),
-            default=self.thread_hard_limit_tokens,
-        )
-        soft_limit_tokens = max(1, soft_limit_tokens)
-        hard_limit_tokens = max(soft_limit_tokens, hard_limit_tokens)
-
         try:
             threads = await self._list_threads(
                 participant_account_id=participant_account_id,
@@ -1852,17 +1805,12 @@ class RegistryService:
 
         results: list[dict[str, Any]] = []
         for item in threads:
-            approx_tokens = _coerce_non_negative_int(item.get("approx_tokens"))
             pending_messages = _extract_pending_messages(item)
-            if pending_messages <= self.thread_keep_tail_messages:
-                status = "ok"
-            else:
-                status = _classify_thread_status(approx_tokens, soft_limit_tokens, hard_limit_tokens)
             item_response = {k: v for k, v in item.items() if k != "_last_message_is_checkpoint"}
             results.append(
                 {
                     **item_response,
-                    "status": status,
+                    "status": "ok",
                     "pending_messages": pending_messages,
                 }
             )
@@ -1872,9 +1820,8 @@ class RegistryService:
             "limit": safe_limit,
             "participant_account_id": participant_account_id,
             "participant_username": participant_username,
-            "soft_limit_tokens": soft_limit_tokens,
-            "hard_limit_tokens": hard_limit_tokens,
             "token_estimate_chars_per_token": self.token_estimate_chars_per_token,
+            "thread_management_owner": "agent_infra",
             "results": results,
             "generated_at": utc_now_iso(),
         }
@@ -2018,9 +1965,6 @@ class RegistryService:
         local_persist_started = time.perf_counter()
         self._persist_message_local(message)
         self._record_latency("local.persist_message", (time.perf_counter() - local_persist_started) * 1000.0)
-        compaction_started = time.perf_counter()
-        await self._maybe_emit_compaction_event(trigger_message=message)
-        self._record_latency("compaction.maybe_emit", (time.perf_counter() - compaction_started) * 1000.0)
 
     async def _gc_loop(self) -> None:
         while True:
@@ -2756,7 +2700,6 @@ class RegistryService:
         stale_set = set(stale_thread_ids)
         for thread_id in stale_thread_ids:
             self._local_threads.pop(thread_id, None)
-            self._compaction_event_state.pop(thread_id, None)
         stale_message_ids = [
             message_id
             for message_id, message in self._local_messages.items()
@@ -2772,157 +2715,6 @@ class RegistryService:
         )
 
     @staticmethod
-    def _is_compaction_event_payload(payload: Any) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        payload_type = str(payload.get("type") or "").strip().lower()
-        return payload_type in {"compaction_required", "checkpoint"}
-
-    def _has_online_agent_session(self, account_id: str) -> bool:
-        normalized = str(account_id or "").strip()
-        if not normalized:
-            return False
-        for info in self._sessions.values():
-            if info.account_id == normalized and bool(info.capabilities):
-                return True
-        return False
-
-    def _has_online_session(self, account_id: str) -> bool:
-        normalized = str(account_id or "").strip()
-        if not normalized:
-            return False
-        for info in self._sessions.values():
-            if info.account_id == normalized:
-                return True
-        return False
-
-    def _choose_compaction_target_account(
-        self,
-        *,
-        thread: dict[str, Any],
-        trigger_message: AgentMessage,
-    ) -> str | None:
-        participants = thread.get("participants") if isinstance(thread.get("participants"), list) else []
-        participant_ids = [str(item).strip() for item in participants if str(item).strip()]
-        preferred = [
-            str(trigger_message.to_account_id or "").strip(),
-            str(trigger_message.from_account_id or "").strip(),
-        ]
-        for candidate in preferred:
-            if candidate and self._has_online_agent_session(candidate):
-                return candidate
-        for candidate in participant_ids:
-            if self._has_online_agent_session(candidate):
-                return candidate
-        for candidate in preferred:
-            if candidate and self._has_online_session(candidate):
-                return candidate
-        for candidate in participant_ids:
-            if self._has_online_session(candidate):
-                return candidate
-        fallback = str(thread.get("created_by_account_id") or "").strip()
-        if fallback:
-            return fallback
-        for candidate in preferred:
-            if candidate:
-                return candidate
-        return participant_ids[0] if participant_ids else None
-
-    async def _maybe_emit_compaction_event(self, *, trigger_message: AgentMessage) -> None:
-        if not self.compaction_event_enabled or not self._nc:
-            return
-        thread_id = str(trigger_message.thread_id or "").strip()
-        if not thread_id:
-            return
-        if self._is_compaction_event_payload(trigger_message.payload):
-            return
-        thread = await self._get_thread_status(thread_id)
-        if not thread:
-            return
-        approx_tokens = _coerce_non_negative_int(thread.get("approx_tokens"))
-        status = _classify_thread_status(
-            approx_tokens=approx_tokens,
-            soft_limit_tokens=self.thread_soft_limit_tokens,
-            hard_limit_tokens=self.thread_hard_limit_tokens,
-        )
-        if status != "needs_compaction":
-            self._compaction_event_state.pop(thread_id, None)
-            return
-        latest_checkpoint_end = _coerce_non_negative_int(thread.get("latest_checkpoint_end"))
-        message_count = _coerce_non_negative_int(thread.get("message_count"))
-        pending_messages = _extract_pending_messages(thread)
-        if pending_messages <= self.thread_keep_tail_messages:
-            self._compaction_event_state.pop(thread_id, None)
-            return
-        now_mono = time.monotonic()
-        prior = self._compaction_event_state.get(thread_id)
-        if prior is not None:
-            prior_checkpoint_end, prior_sent_at = prior
-            if latest_checkpoint_end <= prior_checkpoint_end and (now_mono - prior_sent_at) < self.compaction_event_cooldown_seconds:
-                return
-        to_account_id = self._choose_compaction_target_account(thread=thread, trigger_message=trigger_message)
-        if not to_account_id:
-            return
-
-        sent_at_dt = _utc_now()
-        sent_at = _iso_utc(sent_at_dt)
-        expires_at = _iso_utc(sent_at_dt + timedelta(seconds=300))
-        byte_count = _coerce_non_negative_int(thread.get("byte_count"))
-        event_payload = {
-            "type": "compaction_required",
-            "thread_id": thread_id,
-            "status": status,
-            "message_count": message_count,
-            "pending_messages": pending_messages,
-            "byte_count": byte_count,
-            "approx_tokens": approx_tokens,
-            "soft_limit_tokens": self.thread_soft_limit_tokens,
-            "hard_limit_tokens": self.thread_hard_limit_tokens,
-            "keep_tail_messages": self.thread_keep_tail_messages,
-            "latest_checkpoint_end": latest_checkpoint_end,
-            "requested_at": sent_at,
-            "reason": "thread_token_limit_exceeded",
-        }
-        event_message = AgentMessage(
-            message_id=f"msg_{new_ulid().lower()}",
-            from_agent=f"registry_{self.server_id}",
-            to_agent="thread_compactor",
-            payload=event_payload,
-            sent_at=sent_at,
-            from_account_id=f"acct_registry_{self.server_id}",
-            to_account_id=to_account_id,
-            ttl_ms=300_000,
-            expires_at=expires_at,
-            trace_id=f"trace_{new_ulid().lower()}",
-            thread_id=thread_id,
-            parent_message_id=trigger_message.message_id,
-            kind="system",
-            schema_version="1.1",
-            idempotency_key=f"compaction:{thread_id}:{latest_checkpoint_end}:{message_count}",
-        )
-        try:
-            await self._nc.publish(
-                account_inbox_subject(to_account_id),
-                encode_json(event_message.to_dict()),
-            )
-            self._compaction_event_state[thread_id] = (latest_checkpoint_end, now_mono)
-            self.logger.info(
-                "emitted compaction event thread_id=%s to_account_id=%s approx_tokens=%s",
-                thread_id,
-                to_account_id,
-                approx_tokens,
-            )
-            emit_agentnet_log(
-                f"Compaction requested: thread={format_thread(thread_id)} -> {self._presentation_account_label(to_account_id)}",
-                enabled=self._agentnet_logs_enabled,
-            )
-        except Exception:  # noqa: BLE001
-            self.logger.exception(
-                "failed emitting compaction event thread_id=%s to_account_id=%s",
-                thread_id,
-                to_account_id,
-            )
-
     def _presentation_agent_label(self, agent: AgentInfo) -> str:
         return format_actor(
             name=agent.name,
@@ -2994,7 +2786,7 @@ async def amain() -> None:
     dev_auth_enabled = parse_bool(os.getenv("DEV_AUTH"), default=False)
     dev_auth_max_skew_seconds = float(os.getenv("DEV_AUTH_MAX_SKEW_SECONDS", "120"))
     dev_auth_nonce_ttl_seconds = float(os.getenv("DEV_AUTH_NONCE_TTL_SECONDS", "300"))
-    compaction_event_enabled = parse_bool(os.getenv("THREAD_COMPACTION_EVENT_ENABLED"), default=True)
+    compaction_event_enabled = parse_bool(os.getenv("THREAD_COMPACTION_EVENT_ENABLED"), default=False)
     compaction_event_cooldown_seconds = float(os.getenv("THREAD_COMPACTION_EVENT_COOLDOWN_SECONDS", "120"))
     db_write_batch_enabled = parse_bool(os.getenv("DB_WRITE_BATCH_ENABLED"), default=True)
     db_write_batch_size = int(os.getenv("DB_WRITE_BATCH_SIZE", "64"))

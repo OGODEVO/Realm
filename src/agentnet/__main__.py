@@ -389,20 +389,13 @@ async def _run_thread_list(
         expand=True,
     )
     table.add_column("Thread ID", style="field.value", no_wrap=True)
-    table.add_column("Status", justify="center")
     table.add_column("Messages", justify="right", style="field.value")
+    table.add_column("Tail Msgs", justify="right", style="field.value")
     table.add_column("Tokens~", justify="right", style="field.value")
     table.add_column("Last Activity", style="dim", justify="right")
     table.add_column("Participants", style="dim")
 
     for row in rows:
-        state = str(row.get("status") or "unknown")
-        if state == "ok":
-            state_text = Text("ok", style="success")
-        elif state == "warn":
-            state_text = Text("warn", style="warn")
-        else:
-            state_text = Text(state, style="msg.error")
         thread_value = str(row.get("thread_id") or "—")
         participants = row.get("participants")
         if isinstance(participants, list):
@@ -411,8 +404,8 @@ async def _run_thread_list(
             participant_text = "—"
         table.add_row(
             thread_value,
-            state_text,
             str(row.get("message_count", 0)),
+            str(row.get("pending_messages", 0)),
             str(row.get("approx_tokens", 0)),
             _time_ago(row.get("last_message_at")),
             participant_text,
@@ -437,19 +430,18 @@ async def _run_thread_status(
             timeout=timeout,
         )
 
-    state = str(status.get("status") or "unknown")
-    state_style = "success" if state == "ok" else "warn" if state == "warn" else "msg.error"
-
     table = Table(border_style="bright_black", show_header=False, show_edge=True, expand=False)
     table.add_column("k", style="field.label", no_wrap=True)
     table.add_column("v", style="field.value")
     table.add_row("Thread", str(status.get("thread_id", thread_id)))
-    table.add_row("Status", Text(state, style=state_style))
+    table.add_row("Status", str(status.get("status", "ok")))
     table.add_row("Messages", str(status.get("message_count", 0)))
+    table.add_row("Tail Msgs", str(status.get("pending_messages", 0)))
     table.add_row("Bytes", str(status.get("byte_count", 0)))
     table.add_row("Tokens~", str(status.get("approx_tokens", 0)))
-    table.add_row("Soft/Hard", f"{status.get('soft_limit_tokens', '—')} / {status.get('hard_limit_tokens', '—')}")
     table.add_row("Checkpoint", str(status.get("latest_checkpoint_end", 0)))
+    if status.get("thread_management_owner"):
+        table.add_row("Owner", str(status.get("thread_management_owner")))
     table.add_row("Last Msg At", str(status.get("last_message_at") or "—"))
     participants = status.get("participants")
     if isinstance(participants, list) and participants:
@@ -936,19 +928,19 @@ def main() -> int:
     threads_filter.add_argument("--participant-username", help="Only threads including this username")
     threads_parser.add_argument("--query", default="", help="Filter by thread_id substring")
     threads_parser.add_argument("--limit", type=int, default=20)
-    threads_parser.add_argument("--soft-limit-tokens", type=int, help="Optional soft threshold override")
-    threads_parser.add_argument("--hard-limit-tokens", type=int, help="Optional hard threshold override")
+    threads_parser.add_argument("--soft-limit-tokens", type=int, help="Deprecated compatibility arg; ignored")
+    threads_parser.add_argument("--hard-limit-tokens", type=int, help="Deprecated compatibility arg; ignored")
     threads_parser.add_argument("--timeout", type=float, default=2.0)
 
     thread_parser = subparsers.add_parser(
         "thread-status",
-        help="Inspect thread size/status for compaction decisions",
+        help="Inspect stored thread stats",
         formatter_class=_RichHelpFormatter,
     )
     thread_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     thread_parser.add_argument("--thread-id", required=True, help="Thread ID to inspect")
-    thread_parser.add_argument("--soft-limit-tokens", type=int, help="Optional soft threshold override")
-    thread_parser.add_argument("--hard-limit-tokens", type=int, help="Optional hard threshold override")
+    thread_parser.add_argument("--soft-limit-tokens", type=int, help="Deprecated compatibility arg; ignored")
+    thread_parser.add_argument("--hard-limit-tokens", type=int, help="Deprecated compatibility arg; ignored")
     thread_parser.add_argument("--timeout", type=float, default=2.0)
 
     thread_messages_parser = subparsers.add_parser(

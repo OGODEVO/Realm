@@ -317,11 +317,8 @@ async def get_thread_status_with_client(
     if not normalized_thread_id:
         raise ValueError("thread_id is required")
 
+    _ = soft_limit_tokens, hard_limit_tokens
     payload: dict[str, Any] = {"thread_id": normalized_thread_id}
-    if soft_limit_tokens is not None:
-        payload["soft_limit_tokens"] = max(1, int(soft_limit_tokens))
-    if hard_limit_tokens is not None:
-        payload["hard_limit_tokens"] = max(1, int(hard_limit_tokens))
 
     try:
         response = await nc.request(REGISTRY_THREAD_STATUS_SUBJECT, encode_json(payload), timeout=timeout)
@@ -383,6 +380,7 @@ async def list_threads_with_client(
     hard_limit_tokens: int | None = None,
     timeout: float = 2.0,
 ) -> list[dict[str, Any]]:
+    _ = soft_limit_tokens, hard_limit_tokens
     safe_limit = max(1, min(int(limit), 100))
     payload: dict[str, Any] = {
         "query": str(query or "").strip(),
@@ -392,10 +390,6 @@ async def list_threads_with_client(
         payload["participant_account_id"] = participant_account_id.strip()
     if participant_username:
         payload["participant_username"] = participant_username.strip().lower().lstrip("@")
-    if soft_limit_tokens is not None:
-        payload["soft_limit_tokens"] = max(1, int(soft_limit_tokens))
-    if hard_limit_tokens is not None:
-        payload["hard_limit_tokens"] = max(1, int(hard_limit_tokens))
 
     try:
         response = await nc.request(REGISTRY_THREAD_LIST_SUBJECT, encode_json(payload), timeout=timeout)
