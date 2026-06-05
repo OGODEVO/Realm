@@ -37,6 +37,7 @@ from mcp.server.fastmcp import FastMCP
 
 NATS_URL = os.getenv("REALM_NATS_URL", "nats://agentnet_secret_token@localhost:4222")
 AGENT_NAME = os.getenv("REALM_AGENT_NAME", "medusa-bridge")
+BLOB_DIR = os.getenv("REALM_BLOB_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".blobs"))
 
 _sdk: AgentSDK | None = None
 _current_thread_id: str | None = None
@@ -64,6 +65,7 @@ async def lifespan(server: FastMCP):
             capabilities=["mcp-bridge", "realm-tools"],
             nats_url=NATS_URL,
             metadata={"kind": "mcp-server", "hostname": os.uname().nodename},
+            blob_store_dir=BLOB_DIR,
         )
         await _sdk.start()
         _current_thread_id = _sdk.new_thread_id()
@@ -90,6 +92,8 @@ mcp = FastMCP(
         "Replies auto-chain. Use new_thread() to start a fresh conversation."
     ),
     lifespan=lifespan,
+    host=os.getenv("MCP_HOST", "127.0.0.1"),
+    port=int(os.getenv("MCP_PORT", "8104")),
 )
 
 # ---------------------------------------------------------------------------
@@ -307,4 +311,8 @@ async def registry_metrics() -> str:
 
 
 if __name__ == "__main__":
-    mcp.run(transport="stdio")
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "sse":
+        mcp.run(transport="sse")
+    else:
+        mcp.run(transport="stdio")
