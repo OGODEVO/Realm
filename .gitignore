@@ -35,6 +35,9 @@ logs/
 .mypy_cache/
 .ruff_cache/
 
+# macOS
+.DS_Store
+
 # Realm CLI memory
 .realm/
 realm
