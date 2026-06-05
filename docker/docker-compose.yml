@@ -3,8 +3,9 @@ services:
     image: nats:2.10-alpine
     command: ["-js", "-m", "8222", "--auth", "agentnet_secret_token"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "127.0.0.1:4222:4222"
+      - "100.84.141.84:4222:4222"
+      - "127.0.0.1:8222:8222"
 
   postgres:
     image: postgres:16-alpine
