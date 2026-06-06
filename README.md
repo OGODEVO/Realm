@@ -67,6 +67,53 @@ MCP_TRANSPORT=sse MCP_HOST=100.84.141.84 MCP_PORT=8104 \
   python mcp-server/realm-mcp.py
 ```
 
+## OpenCode-backed Realm Agent
+
+Run a persistent Realm agent that answers `agentnet request` calls by forwarding
+the prompt to a headless OpenCode server:
+
+```bash
+export REALM_NATS_URL=nats://agentnet_secret_token@100.84.141.84:4222
+export REALM_AGENT_ID=m2-opencode-agent
+export REALM_AGENT_NAME="M2 OpenCode Agent"
+export REALM_USERNAME=m2-opencode
+
+export OPENCODE_BIN=/Users/klyexy/.opencode/bin/opencode
+export OPENCODE_URL=http://127.0.0.1:4096
+export OPENCODE_SERVER_USERNAME=opencode
+export OPENCODE_SERVER_PASSWORD='change-me'
+export OPENCODE_MODEL=opencode/big-pickle
+export OPENCODE_AGENT=build
+export OPENCODE_DIR=/path/to/project
+
+python examples/opencode_realm_agent.py
+```
+
+Send a request:
+
+```bash
+agentnet request \
+  --nats-url "$REALM_NATS_URL" \
+  --to-username m2-opencode \
+  '{"text":"What is 2+2?"}'
+```
+
+The handler replies with `sdk.node.reply(...)`, so callers receive the response
+on the original request. It does not use `send_text` for request replies.
+
+Continuous chat is supported per Realm thread. The example stores a mapping from
+`thread_id` to OpenCode `sessionID` in:
+
+```bash
+.realm/opencode_sessions.json
+```
+
+Override with:
+
+```bash
+export REALM_OPENCODE_SESSION_MAP=/path/to/opencode_sessions.json
+```
+
 ## Multi-machine
 
 | Machine | NATS URL |
