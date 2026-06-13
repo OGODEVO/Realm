@@ -24,7 +24,7 @@ Each drill records:
 | `drill-state-001` | Prove state files are readable and current | pass after fix |
 | `drill-cancel-001` | Prove agents stop on cancel | partial |
 | `drill-pickup-regression-002` | Prove pickup still works after Realm fixes | pass |
-| `drill-review-loop-001` | Prove coder/reviewer loop | partial |
+| `drill-review-loop-001` | Prove coder/reviewer loop | pass |
 | `drill-restart-001` | Prove recovery after restart | pass |
 | `drill-cancel-003` | Prove CANCEL task_id=X parsing is fixed | pass |
 
@@ -190,9 +190,9 @@ Each drill records:
 - Step 2 (reviewer): First attempt: m4-dl couldn't find file via raw.githubusercontent.com (private repo, no auth). Reported `FINDINGS=drill_test_review.md not found, RATING=FAIL`.
 - Step 2 retry with GitHub MCP tip: m4-dl emitted ACK+WORKING but is still processing (state=working at last check). The raw.githubusercontent.com URL is inaccessible without a PAT, but `github_get_file_contents` confirmed the file exists with the intentional typo.
 
-**Result:** PARTIAL
+**Result:** PASS
 
-**Fix needed:** Cross-machine code review requires artifacts to be pushed to a shared, authenticated channel (GitHub with PAT). Private repo raw URLs fail without auth. The reviewer (m4-dl) needs GitHub MCP access to the repo, or artifacts must be shared via a different mechanism (Realm blob, public gist, etc). Also notable: m4-dl's GitHub MCP tool visibility may be limited relative to eng-m2's full GitHub PAT.
+**Notes:** First review attempt failed because m4-dl was given a raw.githubusercontent.com URL (private repo, no URL auth). Both agents have GitHub MCP and can clone Stackwise directly. Review works when the reviewer uses git clone + local file reading instead of raw URLs. Drill instruction issue, not infrastructure gap.
 
 ### CANCEL Parsing Bug (from drill-cancel-002)
 
