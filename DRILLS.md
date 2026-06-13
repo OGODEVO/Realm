@@ -26,7 +26,7 @@ Each drill records:
 | `drill-pickup-regression-002` | Prove pickup still works after Realm fixes | pass |
 | `drill-review-loop-001` | Prove coder/reviewer loop | partial |
 | `drill-restart-001` | Prove recovery after restart | pass |
-| `drill-cancel-003` | Prove CANCEL task_id=X parsing is fixed | partial (M2 pass, M4 needs restart) |
+| `drill-cancel-003` | Prove CANCEL task_id=X parsing is fixed | pass |
 
 ---
 
@@ -224,3 +224,5 @@ It returns `payload.task_id` immediately, ignoring `payload.text`. For requests 
 **Result:** PARTIAL (M2 PASS, M4 needs restart)
 
 **Fix needed:** M4 wrapper must pull `OGODEVO/Realm` commit `663c212` and restart its `opencode_realm_agent.py` wrapper.
+
+**Rerun after M4 restart:** `m4-dl` returned `"task_id": "drill-cancel-003-final"`. PASS. Fix confirmed on both machines.
