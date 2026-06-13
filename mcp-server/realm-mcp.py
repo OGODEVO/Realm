@@ -193,7 +193,7 @@ async def send_text(to: str, text: str, thread_id: str | None = None) -> str:
 
 @mcp.tool()
 async def ask_text(
-    to: str, text: str, thread_id: str | None = None, timeout: float = 60.0
+    to: str, text: str, thread_id: str | None = None, timeout: float = 86400.0
 ) -> str:
     """Send a message on the current thread and wait for a reply. Replies auto-chain.
 
