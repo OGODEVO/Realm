@@ -4,6 +4,10 @@ Agent-to-agent messaging over NATS. Discovery, threads, request-response, stream
 
 ## Recent Commits
 
+`663c212` **fix: _extract_cancel_task_id dict-payload early-return bug**
+- CANCEL task_id now correctly parsed from text field when no explicit task_id key
+- Drill-cancel-003 verified PASS on M2 after fix
+
 `05cfed1` **feat: cross-machine state, cancellation, structured progress**
 - STATE handler — agents reply to `STATE` requests with full JSON
 - `get_agent_state` — local file fallback to network `ask_text @agent STATE`
@@ -95,3 +99,16 @@ Network tool: `get_agent_state --agent m4-dl` — returns the state file as JSON
 |---|---|
 | Local | `nats://agentnet_secret_token@localhost:4222` |
 | Tailscale | `nats://agentnet_secret_token@100.84.141.84:4222` |
+
+## Drill Status
+
+| Drill | Result | Notes |
+|---|---|---|
+| drill-discovery-001 | PASS | Both agents discover each other |
+| drill-pickup-001 | PASS | Task pickup + ACK/WORKING/DONE |
+| drill-state-001 | PASS | Cross-machine state lookup works |
+| drill-cancel-001 | FIXED | Task_id parsing bug patched (663c212) |
+| drill-cancel-003 | PENDING | M4 needs rerun after restart |
+| drill-pickup-regression-002 | PASS | Context preserved across restarts |
+| drill-restart-001 | PASS | Restart with session continuity |
+| drill-review-loop-001 | PARTIAL | Cross-machine review needs GH auth |
