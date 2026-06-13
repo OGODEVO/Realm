@@ -310,6 +310,28 @@ async def registry_metrics() -> str:
     return _json(await _get_sdk().registry_metrics())
 
 
+@mcp.tool()
+async def get_agent_state(agent: str) -> str:
+    """Read a Realm agent's current task state from its local JSON state file.
+
+    agent: agent name (e.g. m4-dl, eng-m2)
+    """
+    state_dir = os.getenv(
+        "REALM_STATE_DIR",
+        os.path.join(os.path.expanduser("~"), ".local", "share"),
+    )
+    state_path = os.path.join(
+        os.path.expanduser(state_dir), agent, "state", f"{agent}.json"
+    )
+    try:
+        with open(state_path, encoding="utf-8") as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return _json({"error": f"no state file for {agent}", "path": state_path})
+    except Exception as exc:
+        return _json({"error": str(exc), "path": state_path})
+
+
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "sse":

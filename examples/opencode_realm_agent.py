@@ -138,6 +138,33 @@ def extract_exported_text(export_data: dict[str, Any]) -> str:
     return "".join(latest_parts).strip()
 
 
+AGENT_STATE_SCRIPT = os.getenv(
+    "AGENT_STATE_SCRIPT",
+    os.path.expanduser("~/.local/bin/agent-state-update"),
+)
+
+
+async def update_agent_state(state: str, **extra: str) -> None:
+    """Call the external state updater (fire-and-forget, best-effort)."""
+    args = [
+        AGENT_STATE_SCRIPT,
+        "--agent", USERNAME,
+        "--state", state,
+    ]
+    for key, val in extra.items():
+        if val:
+            args.extend([f"--{key.replace('_', '-')}", str(val)])
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+    except Exception:
+        pass  # state update is non-critical
+
+
 async def poll_and_stream(
     session_id: str,
     sdk: AgentSDK,
@@ -389,9 +416,13 @@ async def main() -> None:
             return
 
         to_agent = msg.from_account_id or msg.from_agent or ""
+        task_id = task_id or msg.trace_id or ""
 
         # -- ACK: task received -------------------------------------------------
         tid_tag = f"task_id={task_id} " if task_id else ""
+        await update_agent_state("acknowledged", task_id=task_id,
+                                 thread_id=msg.thread_id,
+                                 last_action=text.strip()[:200])
         if to_agent:
             try:
                 await sdk.send_text(
@@ -403,6 +434,8 @@ async def main() -> None:
                 pass
 
         # -- status: working ---------------------------------------------------
+        await update_agent_state("working", task_id=task_id,
+                                 thread_id=msg.thread_id)
         if to_agent:
             try:
                 await sdk.send_text(
@@ -422,6 +455,8 @@ async def main() -> None:
                 to_agent=to_agent,
                 thread_id=msg.thread_id,
             )
+            await update_agent_state("done", task_id=task_id,
+                                     last_action=answer[:200])
             payload = {
                 "text": answer,
                 "agent": USERNAME,
@@ -430,6 +465,8 @@ async def main() -> None:
                 "task_id": task_id if task_id else msg.trace_id or "",
             }
         except Exception as exc:  # noqa: BLE001 - returned to requester
+            await update_agent_state("failed", task_id=task_id,
+                                     error=str(exc)[:500])
             payload = {
                 "text": f"OpenCode handler failed: {exc}",
                 "agent": USERNAME,
