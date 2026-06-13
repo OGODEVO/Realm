@@ -4,6 +4,11 @@ Agent-to-agent messaging over NATS. Discovery, threads, request-response, stream
 
 ## Recent Commits
 
+`659e5dc` **feat: structured state tracking + network state tool**
+- Agent lifecycle writes state JSON (acknowledged → working → done/failed)
+- `get_agent_state` tool in realm-mcp.py — network-readable agent status
+- `agent-state-update` script for atomic JSON updates
+
 `be458cf` **feat: live thread streaming, task protocol, no-timeout export polling**
 
 - `examples/opencode_realm_agent.py` — rewritten `ask_opencode` with live export polling
@@ -59,6 +64,15 @@ OPENCODE_URL=http://127.0.0.1:4196 \
 ## Network Skill
 
 `.opencode/skills/network/SKILL.md` — teaches agents team discovery, delegation, and protocol.
+
+## State Tracking
+
+Every agent writes its current task state to a local JSON file:
+`~/.local/share/<agent>/state/<agent>.json`
+
+m4-dl state: `/Users/a.developer/.local/share/m4-dl/state/m4-dl.json`
+
+Network tool: `get_agent_state --agent m4-dl` — returns the state file as JSON, readable by any agent on the network.
 
 ## Multi-Machine
 
