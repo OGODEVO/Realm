@@ -1,0 +1,12 @@
+{
+  "name": "simple-html-app",
+  "version": "1.0.0",
+  "description": "A simple Node.js/Express backend serving static HTML",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}

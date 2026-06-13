@@ -1,10 +1,34 @@
 # Stackwise — Agent Mission Tracker
 
-**Last update:** Sat Jun 13 2026 ~09:00 UTC
+**Last update:** Sat Jun 13 2026 ~10:30 UTC
 
 **Mission:** Turn stack-wise (iOS supplement tracking app) into a full business.
 **Repo:** https://github.com/OGODEVO/stack-wise
 **Local:** /Users/klyexy/Stackwise
+
+---
+
+## CYCLE 2 — Code Complete (PR #7)
+
+**Status:** 🟢 All code written. Waiting for account provisioning to merge PR #7 and deploy.
+
+**PR #7: https://github.com/OGODEVO/stack-wise/pull/7** — Contains all remaining code work:
+
+### What was built this cycle:
+1. ✅ **Schema bug fix** — `FOR EACH RULE` → `FOR EACH ROW` (would have crashed deployment)
+2. ✅ **Error handling overhaul** — PersistenceService now uses proper do/catch + os_log; no more `try!` crash paths
+3. ✅ **Analytics integration** — Compile-safe TelemetryDeck + Sentry; 20+ tracking events wired into AppState + IAPManager
+4. ✅ **Unit tests** — 40+ tests covering all models, Streak logic, AppState methods, ScanResult conversion
+5. ✅ **watchOS app** — Today checklist with WCSession sync; supplements from iPhone, toggle check-ins on watch
+6. ✅ **Xcode targets** — Added watchOS and test targets to project.pbxproj
+7. ✅ **CI/CD** — Parallel lint, build iOS, test iOS, build watchOS
+8. ✅ **Shared code** — `Shared/Models/Supplement.swift` for iOS↔Watch sync
+
+### Still blocked by accounts:
+1. ❌ Add TelemetryDeck + Sentry SPM packages (needs Xcode, not a terminal operation)
+2. ❌ Deploy schema.sql to Supabase
+3. ❌ Apple Sign-In entitlement + App Store Connect products
+4. ❌ Wire RevenueCat as canonical purchase layer
 
 ---
 
@@ -75,11 +99,12 @@ Stackwise App
 
 ## What's Blocked & What's Needed
 
-### Accounts Required (from @a.developer or setup)
-1. **Apple Developer Program** ($99/yr) — needed for Sign-In, StoreKit, App Store
-2. **Supabase account** (free tier to start) — backend deployment
+### Accounts Required (being provisioned by a.developer)
+1. **Apple Developer Program** ($99/yr) — Sign-In, StoreKit, App Store
+2. **Supabase account** (free tier) — backend deployment
 3. **TelemetryDeck account** (free tier) — analytics
 4. **Sentry account** (free tier) — crash reporting
+5. **RevenueCat account** (free tier) — subscription management & IAP verification
 
 ### Technical Tasks Still Open
 1. **Add all new files to Xcode project** — drag new directories into Xcode navigator
