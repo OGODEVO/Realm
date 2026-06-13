@@ -24,8 +24,9 @@ Each drill records:
 | `drill-state-001` | Prove state files are readable and current | pass after fix |
 | `drill-cancel-001` | Prove agents stop on cancel | partial |
 | `drill-pickup-regression-002` | Prove pickup still works after Realm fixes | pass |
-| `drill-review-loop-001` | Prove coder/reviewer loop | pending |
-| `drill-restart-001` | Prove recovery after restart | pending |
+| `drill-review-loop-001` | Prove coder/reviewer loop | partial |
+| `drill-restart-001` | Prove recovery after restart | pass |
+| `drill-cancel-003` | Prove CANCEL task_id=X parsing is fixed | pending |
 
 ---
 
@@ -153,3 +154,54 @@ Each drill records:
 **Result:** PASS
 
 **Notes:** The `realm_ask_text` call for `eng-m2` timed out client-side, but the final reply arrived and state updated. Treat as a client timeout/timing issue, not agent failure. TUI should parse JSON progress strings or Realm should send them as structured payload objects rather than JSON encoded in `text`.
+
+---
+
+### `drill-restart-001`
+
+**Goal:** Prove agents can report their current task and planned next action after any restart/reconnection.
+
+**Agents:** `eng-m2`, `m4-dl`
+
+**Expected:** Each reads its state file and replies with current TASK/STATE/NEXT.
+
+**Observed:**
+
+- `eng-m2`: `TASK=stackwise-backend-hardening-001 STATE=notified`, `NEXT=reconstruct Stackwise context (STATUS.md, AGENT_TASKS.md, Realm thread) then continue backend-post-merge-hardening coding/review loop`.
+- `m4-dl`: `TASK=625dbece162045b69704e09a828f78d8 STATE=working`, `NEXT=idle, awaiting next task`.
+
+**Result:** PASS
+
+**Notes:** eng-m2 correctly identified real task and recovery plan. m4-dl reported a stale task ID from a prior drill.
+
+---
+
+### `drill-review-loop-001`
+
+**Goal:** Prove coder+reviewer loop: eng-m2 creates artifact, m4-dl reviews and reports findings.
+
+**Agents:** `eng-m2` (coder), `m4-dl` (reviewer)
+
+**Expected:** eng-m2 creates file with intentional typo, m4-dl reads and reports `FINDINGS=typo:testt` and `RATING=PASS`.
+
+**Observed:**
+
+- Step 1 (coder): eng-m2 created `/Users/klyexy/Stackwise/drill_test_review.md` with content `Drill review loop testt file - eng-m2 draft`. Reply: `FILE_CREATED`. File pushed to `backend-post-merge-hardening` branch.
+- Step 2 (reviewer): First attempt: m4-dl couldn't find file via raw.githubusercontent.com (private repo, no auth). Reported `FINDINGS=drill_test_review.md not found, RATING=FAIL`.
+- Step 2 retry with GitHub MCP tip: m4-dl emitted ACK+WORKING but is still processing (state=working at last check). The raw.githubusercontent.com URL is inaccessible without a PAT, but `github_get_file_contents` confirmed the file exists with the intentional typo.
+
+**Result:** PARTIAL
+
+**Fix needed:** Cross-machine code review requires artifacts to be pushed to a shared, authenticated channel (GitHub with PAT). Private repo raw URLs fail without auth. The reviewer (m4-dl) needs GitHub MCP access to the repo, or artifacts must be shared via a different mechanism (Realm blob, public gist, etc). Also notable: m4-dl's GitHub MCP tool visibility may be limited relative to eng-m2's full GitHub PAT.
+
+### CANCEL Parsing Bug (from drill-cancel-002)
+
+**Bug:** In `opencode_realm_agent.py`, `_extract_cancel_task_id` for dict payloads:
+```python
+if isinstance(payload, dict):
+    t = str(payload.get("text") or "")
+    return str(payload.get("task_id") or "").strip()
+```
+It returns `payload.task_id` immediately, ignoring `payload.text`. For requests like `{"text":"CANCEL task_id=X"}`, it should fall through to parse `task_id=X` from the text. The regex parsing branch only runs for string payloads. This causes `task_id=""` in all structured cancel replies from dict-style request messages.
+
+**Fix:** Remove the early return for dict payloads, or chain: try `payload.get("task_id")` first, then fall through to text regex parsing.
