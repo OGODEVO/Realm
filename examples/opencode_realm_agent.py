@@ -456,6 +456,19 @@ async def main() -> None:
         m = re.search(r"task_id=(\S+)", t, re.IGNORECASE)
         return m.group(1) if m else ""
 
+    _TEAM_USERS = frozenset({
+        "eng-m2", "m4-dl",
+        "medusa-bridge", "m2-opencode-mcp",
+        "acct_01kte0xax29t2nkx5smpkt5aw4",  # eng-m2
+        "acct_01ktdcv4wsjrpdzp0mmpxj6kj2",  # m2-opencode-mcp
+        "acct_01ktczjxzaj2zf0pj5z45h1pzj",  # medusa-bridge
+    })
+
+    def _is_from_teammate(msg) -> bool:
+        from_id = str(msg.from_account_id or "")
+        from_agent = str(msg.from_agent or "")
+        return (from_id in _TEAM_USERS or from_agent in _TEAM_USERS)
+
     @sdk.receive
     async def handle_message(msg) -> None:
         text = extract_text_payload(msg.payload)
@@ -464,9 +477,10 @@ async def main() -> None:
             task_id = str(msg.payload.get("task_id") or "")
 
         to_agent = msg.from_account_id or msg.from_agent or ""
+        should_process = msg.kind == "request" or (msg.kind == "direct" and _is_from_teammate(msg))
 
-        # -- CANCEL for direct messages -----------------------------------------
-        if msg.kind == "direct" and _is_cancel_msg(msg.payload):
+        # -- CANCEL (any kind, handled immediately) -----------------------------
+        if _is_cancel_msg(msg.payload):
             cancel_id = _extract_cancel_task_id(msg.payload)
             current = _read_state()
             current_id = str(current.get("task_id") or "")
@@ -479,42 +493,24 @@ async def main() -> None:
                     thread_id=msg.thread_id)
             return
 
-        if msg.kind != "request":
-            if msg.kind == "direct" and text.strip().upper() == "STATE":
-                await sdk.send_text(to_agent,
-                    json.dumps({"type": "state", "data": _read_state()}),
-                    thread_id=msg.thread_id)
-            else:
-                print(
-                    f"received {msg.kind} from {to_agent}: {text}",
-                    flush=True,
-                )
-            return
-
-        # -- STATE query --------------------------------------------------------
+        # -- STATE query (any kind, handled immediately) ------------------------
         if text.strip().upper() == "STATE":
             state_data = _read_state()
-            await sdk.node.reply(msg, {
-                "text": json.dumps({"type": "state", "data": state_data}),
-                "agent": USERNAME,
-                "status": "answered",
-            }, thread_id=msg.thread_id)
+            if msg.kind == "request":
+                await sdk.node.reply(msg, {
+                    "text": json.dumps({"type": "state", "data": state_data}),
+                    "agent": USERNAME,
+                    "status": "answered",
+                }, thread_id=msg.thread_id)
+            elif to_agent:
+                await sdk.send_text(to_agent,
+                    json.dumps({"type": "state", "data": state_data}),
+                    thread_id=msg.thread_id)
             return
 
-        # -- CANCEL for request messages ---------------------------------------
-        if _is_cancel_msg(msg.payload):
-            cancel_id = _extract_cancel_task_id(msg.payload)
-            current = _read_state()
-            current_id = str(current.get("task_id") or "")
-            if cancel_id and cancel_id == current_id:
-                await update_agent_state("cancelled", task_id=cancel_id,
-                                         error="cancelled by coordinator")
-            await sdk.node.reply(msg, {
-                "text": json.dumps({"type": "status", "subtype": "cancelled",
-                                    "task_id": cancel_id, "text": "Task cancelled"}),
-                "agent": USERNAME,
-                "status": "answered",
-            }, thread_id=msg.thread_id)
+        # -- non-processable messages -------------------------------------------
+        if not should_process:
+            print(f"received {msg.kind} from {to_agent}: {text}", flush=True)
             return
 
         task_id = task_id or msg.trace_id or ""
