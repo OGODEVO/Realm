@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 from pathlib import Path
@@ -441,14 +442,17 @@ async def main() -> None:
         return False
 
     def _extract_cancel_task_id(payload: Any) -> str:
+        # explicit task_id in dict payload wins
+        if isinstance(payload, dict):
+            tid = str(payload.get("task_id") or "").strip()
+            if tid:
+                return tid
+        # fallback: regex from text field or raw string
         t = ""
         if isinstance(payload, dict):
             t = str(payload.get("text") or "")
-            return str(payload.get("task_id") or "").strip()
-        if isinstance(payload, str):
+        elif isinstance(payload, str):
             t = payload
-        # parse "CANCEL task_id=X"
-        import re
         m = re.search(r"task_id=(\S+)", t, re.IGNORECASE)
         return m.group(1) if m else ""
 
