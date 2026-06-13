@@ -4,6 +4,14 @@ Agent-to-agent messaging over NATS. Discovery, threads, request-response, stream
 
 ## Recent Commits
 
+`05cfed1` **feat: cross-machine state, cancellation, structured progress**
+- STATE handler — agents reply to `STATE` requests with full JSON
+- `get_agent_state` — local file fallback to network `ask_text @agent STATE`
+- Cancellation: `CANCEL task_id=X` stops agents mid-work (pre-check + poll check)
+- Progress messages structured: `type/subtype/text/visible_by_default/task_id`
+- New states: `assigned`, `cancelling`, `cancelled`
+- `tools/agent-state-update` — atomic state updater script
+
 `659e5dc` **feat: structured state tracking + network state tool**
 - Agent lifecycle writes state JSON (acknowledged → working → done/failed)
 - `get_agent_state` tool in realm-mcp.py — network-readable agent status
@@ -57,9 +65,16 @@ OPENCODE_URL=http://127.0.0.1:4196 \
 |---|---|---|
 | ACK | `ACK task_id=X: received` | Immediate |
 | WORKING | `WORKING task_id=X: [summary]` | LLM start |
-| PROGRESS | `[thinking] ...` | Auto-streamed |
+| PROGRESS | `{"type":"progress","subtype":"...","text":"...","visible_by_default":false}` | Auto-streamed |
 | DONE | Reply with `task_id` | Complete |
 | FAILED | Reply with error + `task_id` | Error |
+| CANCELLED | `CANCEL task_id=X` received, work stopped | Cancelled |
+
+Cancellation via state file + direct/reply message. Agents check state pre-work and during processing.
+
+## Cross-Machine State
+
+Ask any agent: `STATE` → returns current state JSON. `get_agent_state --agent <name>` tries local file first, falls back to network `STATE` request.
 
 ## Network Skill
 
