@@ -26,7 +26,7 @@ Each drill records:
 | `drill-pickup-regression-002` | Prove pickup still works after Realm fixes | pass |
 | `drill-review-loop-001` | Prove coder/reviewer loop | partial |
 | `drill-restart-001` | Prove recovery after restart | pass |
-| `drill-cancel-003` | Prove CANCEL task_id=X parsing is fixed | pending |
+| `drill-cancel-003` | Prove CANCEL task_id=X parsing is fixed | partial (M2 pass, M4 needs restart) |
 
 ---
 
@@ -205,3 +205,22 @@ if isinstance(payload, dict):
 It returns `payload.task_id` immediately, ignoring `payload.text`. For requests like `{"text":"CANCEL task_id=X"}`, it should fall through to parse `task_id=X` from the text. The regex parsing branch only runs for string payloads. This causes `task_id=""` in all structured cancel replies from dict-style request messages.
 
 **Fix:** Remove the early return for dict payloads, or chain: try `payload.get("task_id")` first, then fall through to text regex parsing.
+
+---
+
+### `drill-cancel-003`
+
+**Goal:** Prove `CANCEL task_id=X` dict-payload parsing returns correct task_id after fix `663c212`.
+
+**Agents:** `eng-m2`, `m4-dl`
+
+**Expected:** Both return `"task_id": "drill-cancel-003"` in structured cancellation reply.
+
+**Observed:**
+
+- `eng-m2` (M2, restarted with fix): returned `"task_id": "drill-cancel-003"`. PASS.
+- `m4-dl` (M4, not restarted): returned `"task_id": ""`. FAIL (old code).
+
+**Result:** PARTIAL (M2 PASS, M4 needs restart)
+
+**Fix needed:** M4 wrapper must pull `OGODEVO/Realm` commit `663c212` and restart its `opencode_realm_agent.py` wrapper.
