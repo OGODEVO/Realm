@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Atomic JSON state updater for headless Realm agents.
+
+Writes a minimal JSON blob so TUI bridges and coordinators can read
+actual agent status without guessing from thread messages.
+
+Usage:
+  agent-state-update --agent m4-dl --state working --task-id X --repo /path
+  agent-state-update --agent m4-dl --state done --last-action "audit complete"
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime, timezone
+
+VALID_STATES = frozenset({
+    "idle", "assigned", "waking", "notified", "acknowledged",
+    "working", "cancelling", "cancelled", "blocked", "done", "failed",
+})
+
+DEFAULT_STATE_DIR = os.path.join(
+    os.path.expanduser("~"),
+    ".local", "share", "m4-dl", "state",
+)
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _write_atomic(path: str, data: dict) -> None:
+    """Write JSON to a temp file, then atomically rename onto *path*."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        suffix=".json",
+        prefix=".agent-state-",
+        dir=os.path.dirname(path),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description="Atomic agent state updater")
+    p.add_argument("--agent", required=True, help="Agent name, e.g. m4-dl")
+    p.add_argument("--state", required=True,
+                   choices=sorted(VALID_STATES),
+                   help="Current state")
+    p.add_argument("--task-id", default="", help="Task identifier")
+    p.add_argument("--repo", default="", help="Working repo path")
+    p.add_argument("--branch", default="", help="Current branch")
+    p.add_argument("--thread-id", default="", help="Realm thread ID")
+    p.add_argument("--current-file", default="",
+                   help="File currently being worked on")
+    p.add_argument("--last-action", default="",
+                   help="Human-readable description of current action")
+    p.add_argument("--message-id", default="", help="Last Realm message ID")
+    p.add_argument("--error", default="", help="Error message (for failed/blocked)")
+    p.add_argument("--state-dir", default=DEFAULT_STATE_DIR,
+                   help=f"State directory (default: {DEFAULT_STATE_DIR})")
+
+    args = p.parse_args()
+
+    state_dir = os.path.expanduser(args.state_dir)
+    state_path = os.path.join(state_dir, f"{args.agent}.json")
+
+    data = {
+        "agent": args.agent,
+        "task_id": args.task_id or "",
+        "state": args.state,
+        "repo": args.repo or "",
+        "branch": args.branch or "",
+        "thread_id": args.thread_id or "",
+        "current_file": args.current_file or "",
+        "last_action": args.last_action or "",
+        "message_id": args.message_id or "",
+        "error": args.error or "",
+        "updated_at": _now_iso(),
+    }
+
+    _write_atomic(state_path, data)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

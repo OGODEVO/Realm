@@ -27,6 +27,7 @@ Environment:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
@@ -312,7 +313,10 @@ async def registry_metrics() -> str:
 
 @mcp.tool()
 async def get_agent_state(agent: str) -> str:
-    """Read a Realm agent's current task state from its local JSON state file.
+    """Read a Realm agent's current task state.
+
+    Tries the local state file first. If not found, queries the agent
+    over the Realm network with a ``STATE`` request.
 
     agent: agent name (e.g. m4-dl, eng-m2)
     """
@@ -323,13 +327,37 @@ async def get_agent_state(agent: str) -> str:
     state_path = os.path.join(
         os.path.expanduser(state_dir), agent, "state", f"{agent}.json"
     )
+
+    # -- try local file first -------------------------------------------------
     try:
         with open(state_path, encoding="utf-8") as fh:
-            return fh.read()
+            data = json.loads(fh.read())
+            data["source"] = "local_file"
+            return _json(data)
     except FileNotFoundError:
-        return _json({"error": f"no state file for {agent}", "path": state_path})
+        pass
     except Exception as exc:
-        return _json({"error": str(exc), "path": state_path})
+        return _json({"error": str(exc), "source": "local_file_error", "path": state_path})
+
+    # -- fallback: ask the agent over Realm -----------------------------------
+    sdk = _get_sdk()
+    try:
+        result = await asyncio.wait_for(
+            sdk.ask_text(f"@{agent}", "STATE", timeout=10.0),
+            timeout=15.0,
+        )
+        reply = result.data if isinstance(result.data, dict) else {}
+        text = reply.get("text") or result.text or ""
+        parsed = json.loads(text) if text else {}
+        if isinstance(parsed, dict) and parsed.get("type") == "state":
+            data = parsed.get("data", {})
+            data["source"] = "agent_state_request"
+            return _json(data)
+        return _json({"error": "unexpected STATE reply", "raw": text})
+    except asyncio.TimeoutError:
+        return _json({"error": f"STATE request to {agent} timed out"})
+    except Exception as exc:
+        return _json({"error": str(exc), "source": "agent_state_request_error"})
 
 
 if __name__ == "__main__":

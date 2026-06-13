@@ -219,11 +219,18 @@ async def poll_and_stream(
                         continue
                     seen.add(dedup_key)
 
-                    prefix = {"reasoning": "[thinking] ", "text": ""}.get(ptype, "")
-                    post = f"{prefix}{text}"
+                    visible = ptype != "reasoning"
+                    subtype = {"reasoning": "thinking", "text": "text"}.get(ptype, ptype)
+                    payload = json.dumps({
+                        "type": "progress",
+                        "subtype": subtype,
+                        "text": text,
+                        "task_id": "",
+                        "visible_by_default": visible,
+                    })
                     try:
                         await sdk.send_text(
-                            to_agent, post[:1500], thread_id=thread_id
+                            to_agent, payload, thread_id=thread_id
                         )
                     except Exception:
                         pass  # best-effort streaming
@@ -369,6 +376,15 @@ async def ask_opencode(
                         exported_answer = extract_exported_text(export_data)
                         if exported_answer:
                             return exported_answer
+
+            # -- cancellation check during polling --------------------------
+            try:
+                state_data = _read_state()
+                if state_data.get("state") in ("cancelling", "cancelled"):
+                    return "CANCELLED"
+            except Exception:
+                pass
+
             await asyncio.sleep(EXPORT_POLL_INTERVAL)
 
     if stderr_text:
@@ -401,6 +417,41 @@ async def main() -> None:
         },
     )
 
+    STATE_PATH = os.path.join(
+        os.path.expanduser(
+            os.getenv("REALM_STATE_DIR",
+                      os.path.join("~", ".local", "share", AGENT_ID, "state"))
+        ),
+        f"{USERNAME}.json",
+    )
+
+    def _read_state() -> dict[str, Any]:
+        try:
+            with open(STATE_PATH, encoding="utf-8") as fh:
+                return json.loads(fh.read())
+        except Exception:
+            return {"agent": USERNAME, "state": "idle", "error": "state file not found"}
+
+    def _is_cancel_msg(payload: Any) -> bool:
+        if isinstance(payload, dict):
+            t = str(payload.get("text") or "")
+            return t.strip().upper().startswith("CANCEL")
+        if isinstance(payload, str):
+            return payload.strip().upper().startswith("CANCEL")
+        return False
+
+    def _extract_cancel_task_id(payload: Any) -> str:
+        t = ""
+        if isinstance(payload, dict):
+            t = str(payload.get("text") or "")
+            return str(payload.get("task_id") or "").strip()
+        if isinstance(payload, str):
+            t = payload
+        # parse "CANCEL task_id=X"
+        import re
+        m = re.search(r"task_id=(\S+)", t, re.IGNORECASE)
+        return m.group(1) if m else ""
+
     @sdk.receive
     async def handle_message(msg) -> None:
         text = extract_text_payload(msg.payload)
@@ -408,41 +459,103 @@ async def main() -> None:
         if isinstance(msg.payload, dict):
             task_id = str(msg.payload.get("task_id") or "")
 
-        if msg.kind != "request":
-            print(
-                f"received {msg.kind} from {msg.from_account_id or msg.from_agent}: {text}",
-                flush=True,
-            )
+        to_agent = msg.from_account_id or msg.from_agent or ""
+
+        # -- CANCEL for direct messages -----------------------------------------
+        if msg.kind == "direct" and _is_cancel_msg(msg.payload):
+            cancel_id = _extract_cancel_task_id(msg.payload)
+            current = _read_state()
+            current_id = str(current.get("task_id") or "")
+            if cancel_id and cancel_id == current_id:
+                await update_agent_state("cancelled", task_id=cancel_id,
+                                         error="cancelled by coordinator")
+                await sdk.send_text(to_agent,
+                    json.dumps({"type": "status", "subtype": "cancelled",
+                                "task_id": cancel_id, "text": "Task cancelled"}),
+                    thread_id=msg.thread_id)
             return
 
-        to_agent = msg.from_account_id or msg.from_agent or ""
+        if msg.kind != "request":
+            if msg.kind == "direct" and text.strip().upper() == "STATE":
+                await sdk.send_text(to_agent,
+                    json.dumps({"type": "state", "data": _read_state()}),
+                    thread_id=msg.thread_id)
+            else:
+                print(
+                    f"received {msg.kind} from {to_agent}: {text}",
+                    flush=True,
+                )
+            return
+
+        # -- STATE query --------------------------------------------------------
+        if text.strip().upper() == "STATE":
+            state_data = _read_state()
+            await sdk.node.reply(msg, {
+                "text": json.dumps({"type": "state", "data": state_data}),
+                "agent": USERNAME,
+                "status": "answered",
+            }, thread_id=msg.thread_id)
+            return
+
+        # -- CANCEL for request messages ---------------------------------------
+        if _is_cancel_msg(msg.payload):
+            cancel_id = _extract_cancel_task_id(msg.payload)
+            current = _read_state()
+            current_id = str(current.get("task_id") or "")
+            if cancel_id and cancel_id == current_id:
+                await update_agent_state("cancelled", task_id=cancel_id,
+                                         error="cancelled by coordinator")
+            await sdk.node.reply(msg, {
+                "text": json.dumps({"type": "status", "subtype": "cancelled",
+                                    "task_id": cancel_id, "text": "Task cancelled"}),
+                "agent": USERNAME,
+                "status": "answered",
+            }, thread_id=msg.thread_id)
+            return
+
         task_id = task_id or msg.trace_id or ""
 
-        # -- ACK: task received -------------------------------------------------
-        tid_tag = f"task_id={task_id} " if task_id else ""
+        # -- cancellation pre-check --------------------------------------------
+        current = _read_state()
+        current_state = str(current.get("state") or "")
+        current_id = str(current.get("task_id") or "")
+        if current_state == "cancelling" and current_id == task_id:
+            await update_agent_state("cancelled", task_id=task_id,
+                                     error="cancelled before start")
+            await sdk.node.reply(msg, {
+                "text": json.dumps({"type": "status", "subtype": "cancelled",
+                                    "task_id": task_id, "text": "Task cancelled"}),
+                "agent": USERNAME,
+                "status": "answered",
+            }, thread_id=msg.thread_id)
+            return
+
+        # -- ACK ----------------------------------------------------------------
         await update_agent_state("acknowledged", task_id=task_id,
                                  thread_id=msg.thread_id,
                                  last_action=text.strip()[:200])
         if to_agent:
             try:
-                await sdk.send_text(
-                    to_agent,
-                    f"ACK {tid_tag}received: {text.strip()[:200]}",
-                    thread_id=msg.thread_id,
-                )
+                await sdk.send_text(to_agent,
+                    json.dumps({"type": "progress", "subtype": "status",
+                                "task_id": task_id,
+                                "text": f"ACK received: {text.strip()[:150]}",
+                                "visible_by_default": True}),
+                    thread_id=msg.thread_id)
             except Exception:
                 pass
 
-        # -- status: working ---------------------------------------------------
+        # -- WORKING ------------------------------------------------------------
         await update_agent_state("working", task_id=task_id,
                                  thread_id=msg.thread_id)
         if to_agent:
             try:
-                await sdk.send_text(
-                    to_agent,
-                    f"WORKING {tid_tag}: {text.strip()[:200]}",
-                    thread_id=msg.thread_id,
-                )
+                await sdk.send_text(to_agent,
+                    json.dumps({"type": "progress", "subtype": "status",
+                                "task_id": task_id,
+                                "text": f"WORKING: {text.strip()[:150]}",
+                                "visible_by_default": True}),
+                    thread_id=msg.thread_id)
             except Exception:
                 pass
 
