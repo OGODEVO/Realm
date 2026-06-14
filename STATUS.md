@@ -1,137 +1,78 @@
 # Stackwise — Agent Mission Tracker
 
-**Last update:** Sat Jun 13 2026 ~10:30 UTC
+**Last update:** 2026-06-13T19:01:10Z
 
 **Mission:** Turn stack-wise (iOS supplement tracking app) into a full business.
 **Repo:** https://github.com/OGODEVO/stack-wise
 **Local:** /Users/klyexy/Stackwise
+**Canonical repo tracker:** /Users/klyexy/Stackwise/STATUS.md
+**Canonical task ledger:** /Users/klyexy/Stackwise/AGENT_TASKS.md
+**M2 worker state:** /Users/klyexy/.local/share/m2-agent/state/eng-m2.json
+**Current branch:** `backend-post-merge-hardening` — backend post-merge audit/fixes
 
 ---
 
-## CYCLE 2 — Code Complete (PR #7)
+## CYCLE 4 — Post-Merge Review, Fixes & Quality
 
-**Status:** 🟢 All code written. Waiting for account provisioning to merge PR #7 and deploy.
+**Status:** PR #7, PR #8, PR #9, and PR #10 are merged. PR #10 was merged before m4-dl completed its audit. Backend is not deployed, so this is not production-impacting. Current task is post-merge backend audit/hardening before deployment.
 
-**PR #7: https://github.com/OGODEVO/stack-wise/pull/7** — Contains all remaining code work:
+### Backend Architecture Decision
+- Use FastAPI + Postgres, not Supabase-first.
+- iOS remains local-first with SwiftData.
+- FastAPI owns sync APIs, auth verification, server-side validation, future AI bottle parsing, and webhook integrations.
+- Postgres is the canonical synced data store.
+- `Stackwise/Data/Supabase/schema.sql` is legacy reference only.
+- Current scaffold includes health/readiness endpoints, supplement CRUD, check-in upsert/list, Docker Postgres, and an initial SQL migration.
+- Current auth is a development shim using `X-Stackwise-User-Id`; production must replace this with Apple Sign-In token verification before deployment.
 
-### What was built this cycle:
-1. ✅ **Schema bug fix** — `FOR EACH RULE` → `FOR EACH ROW` (would have crashed deployment)
-2. ✅ **Error handling overhaul** — PersistenceService now uses proper do/catch + os_log; no more `try!` crash paths
-3. ✅ **Analytics integration** — Compile-safe TelemetryDeck + Sentry; 20+ tracking events wired into AppState + IAPManager
-4. ✅ **Unit tests** — 40+ tests covering all models, Streak logic, AppState methods, ScanResult conversion
-5. ✅ **watchOS app** — Today checklist with WCSession sync; supplements from iPhone, toggle check-ins on watch
-6. ✅ **Xcode targets** — Added watchOS and test targets to project.pbxproj
-7. ✅ **CI/CD** — Parallel lint, build iOS, test iOS, build watchOS
-8. ✅ **Shared code** — `Shared/Models/Supplement.swift` for iOS↔Watch sync
+### Active Team
+- **eng-m2** (M2 OpenCode agent) — primary coding agent; implements fixes/features, runs checks, opens PRs, updates status
+- **@m4-dl** (M4 Mac Mini) — reviewer/auditor; examines eng-m2's code for vulnerabilities, bugs, compile risks, regressions, missing tests, privacy/security issues, and product-quality gaps
+- **a.developer** — merged PRs #7 + #8; provisioning accounts continues
 
-### Still blocked by accounts:
-1. ❌ Add TelemetryDeck + Sentry SPM packages (needs Xcode, not a terminal operation)
-2. ❌ Deploy schema.sql to Supabase
-3. ❌ Apple Sign-In entitlement + App Store Connect products
-4. ❌ Wire RevenueCat as canonical purchase layer
+### Operating Model
+- Use a coder/reviewer iteration loop, not feature splitting by default.
+- Every wake cycle, agents read `STATUS.md` and `AGENT_TASKS.md`, then check the Stackwise Realm thread before acting.
+- Agents reconstruct context: previous tasks, current task, current assignment, open blockers, and next expected action.
+- Agents ask the teammate what is current if state is unclear, then split/assign the task at hand.
+- eng-m2 builds or fixes the next highest-value item on a branch.
+- eng-m2 sends @m4-dl a review packet with branch/PR, changed files, risk areas, and what to audit.
+- @m4-dl reports findings back in the Realm thread.
+- eng-m2 triages findings, fixes valid issues, verifies, and asks for another pass if needed.
+- Iterate until there are no blocking findings, then move to the next task.
+- Use `realm_send_text` + `realm_get_thread_messages` for this flow; do not use blocking `realm_ask_text` for long reviews.
+- Agents update `AGENT_TASKS.md` before ending a work cycle.
 
----
+### Post-Merge Findings
+- **PR #7 (merge-all-prs):** Code is on main. No critical issues found.
+- **PR #8 (ios-watch-integration):** Code is on main. One compilation issue found:
+  - `PersistenceService.resetStore()` used `[any PersistentModel.Type]` existential array with `delete<T>(model: T.Type)` — type inference fails with existentials. Fixed by replacing loop with concrete-type helper.
+  - All other code reviewed clean: WatchSessionManager, AppState IAP wiring, data reset, checkInteraction access.
+- **PR #9 (cycle-4-post-merge):** Merged at 11:21:49 UTC. Contains the concrete SwiftData model deletion fix for `resetStore()` and status updates.
 
-## Cycle Summary (Heartbeat 1)
+### What's Still Buildable (No Accounts)
+- XCUITest foundation for UI testing — not started yet
+- Localization string catalogs (.xcstrings)
+- Accessibility audit (VoiceOver, Dynamic Type, Reduce Motion)
+- Performance/load profiling
 
-### What Got Done
+### Blocked On Accounts
+- Apple Developer account: Sign In with Apple entitlement, App Store Connect products, StoreKit validation
+- Backend hosting/Postgres: deploy FastAPI service + managed Postgres or VPS Postgres
+- TelemetryDeck: app ID/API key
+- Sentry: DSN
+- RevenueCat: canonical purchase layer setup
 
-| Area | Deliverable | Status |
-|------|------------|--------|
-| 🔍 Code Audit | Full analysis of 33 Swift files across the entire app | ✅ Complete |
-| 📊 Market Research | 10+ competitors analyzed, TAM sized, personas defined | ✅ Complete |
-| 💾 Persistence | SwiftData models + PersistenceService + AppState wiring | ✅ PR #3 |
-| 🔄 CI/CD | GitHub Actions build+lint workflow | ✅ PR #5 |
-| 🏗 Backend | PostgreSQL schema for Supabase (6 tables, RLS, triggers) | ✅ PR #6 |
-| 💰 Monetization | StoreKit 2 IAPManager (purchase, restore, verify) | ✅ PR #6 |
-| 📈 Analytics | TelemetryDeck + Sentry service with 20+ event types | ✅ PR #6 |
-| 📋 Strategy | Target personas, pricing, influencers, ASO, launch plan | ✅ Issue #4 |
+### Next Agent Instruction
+On the next heartbeat, eng-m2 should:
+1. Read `/Users/klyexy/Stackwise/AGENT_TASKS.md` and continue task `stackwise-backend-hardening-001`.
+2. Review the merged `backend/` FastAPI + Postgres scaffold on main.
+3. Run feasible checks locally.
+4. Send @m4-dl a review packet for the merged backend and ask them to audit for vulnerabilities, auth gaps, data-model issues, sync risks, compile/runtime risks, and missing tests.
+5. Fix valid findings and iterate until clean.
+6. Update both STATUS.md files and `AGENT_TASKS.md` with review requests, findings, fixes, and decisions.
 
-### Open PRs & Issues
-
-| # | Link | What | Status |
-|---|------|------|--------|
-| #3 | [persistence-swiftdata](https://github.com/OGODEVO/stack-wise/pull/3) | SwiftData persistence | 🔄 Open — needs Xcode file add |
-| #5 | [ci-github-actions](https://github.com/OGODEVO/stack-wise/pull/5) | CI/CD workflow | 🔄 Open |
-| #6 | [backend-architecture](https://github.com/OGODEVO/stack-wise/pull/6) | Supabase + IAP + Analytics | 🔄 Open — needs Xcode file add |
-| #4 | [Business Strategy Issue](https://github.com/OGODEVO/stack-wise/issues/4) | Full strategy doc | 📋 Open |
-
----
-
-## Current Architecture (After This Cycle)
-
-```
-Stackwise App
-├── Data/
-│   ├── AppState.swift          ✅ Now persists via SwiftData
-│   ├── Persistence/            ✅ NEW — SwiftData models + service
-│   │   ├── SwiftDataModels.swift
-│   │   └── PersistenceService.swift
-│   ├── Supabase/schema.sql     ✅ NEW — PostgreSQL schema (not yet deployed)
-│   ├── StoreKit/IAPManager.swift ✅ NEW — StoreKit 2 (needs Xcode)
-│   ├── Analytics/AnalyticsService.swift ✅ NEW — TelemetryDeck + Sentry
-│   ├── KeychainStore.swift
-│   └── SampleData.swift
-├── Models/                     (unchanged)
-├── Screens/                    (unchanged)
-├── Components/                 (unchanged)
-├── Theme/                      (unchanged)
-└── .github/workflows/ci.yml   ✅ NEW — GitHub Actions
-```
-
-### Readiness for Production
-
-| Requirement | Status |
-|------------|--------|
-| Data survives restarts | ✅ SwiftData (PR #3) |
-| CI passes on every PR | ✅ GitHub Actions (PR #5) |
-| Backend ready to deploy | ✅ Schema written (PR #6) |
-| IAP code written | ✅ StoreKit 2 (PR #6) |
-| Analytics + crash tracking | ✅ TelemetryDeck + Sentry (PR #6) |
-| Business strategy documented | ✅ Issue #4 |
-| Real Apple Sign-In | ❌ Needs Apple Developer account |
-| Real StoreKit testing | ❌ Needs Apple Developer account |
-| Supabase deployed | ❌ Needs Supabase account |
-| Xcode project files added | ❌ Needs manual Xcode drag-drop |
-| App Store listing | ❌ Needs Apple Developer account |
-
----
-
-## What's Blocked & What's Needed
-
-### Accounts Required (being provisioned by a.developer)
-1. **Apple Developer Program** ($99/yr) — Sign-In, StoreKit, App Store
-2. **Supabase account** (free tier) — backend deployment
-3. **TelemetryDeck account** (free tier) — analytics
-4. **Sentry account** (free tier) — crash reporting
-5. **RevenueCat account** (free tier) — subscription management & IAP verification
-
-### Technical Tasks Still Open
-1. **Add all new files to Xcode project** — drag new directories into Xcode navigator
-2. **Deploy Supabase schema** — run `schema.sql` in Supabase SQL Editor
-3. **Set up RevenueCat** — create products matching `com.reki.stackwise.pro.*`
-4. **Configure Apple Sign-In entitlement** — enable in Xcode capability + Supabase Auth
-
----
-
-## Next Steps (Ordered by Impact)
-
-1. **Add files to Xcode project** — unlocks compilation and testing
-2. **Deploy Supabase project** — enables backend + real auth
-3. **Get Apple Developer account** — enables Sign-In, IAP testing, TestFlight
-4. **Run the app with persistence** — verify data saves/loads correctly
-5. **Submit to TestFlight** — first external beta
-6. **Create App Store listing** — screenshots, keywords, description
-7. **Launch!**
-
----
-
-## Tool Wishlist
-- [ ] ✅ GitHub PAT (configured — working)
-- [ ] Apple Developer account ($99/yr)
-- [ ] Supabase Pro account ($25/mo)
-- [ ] RevenueCat account (free tier)
-- [ ] TelemetryDeck account (free tier)
-- [ ] Sentry account (free tier)
-- [ ] App Store Connect access
-- [ ] Claude API key (for AI label scan)
+### Live Agent State
+- eng-m2 ACKed task `stackwise-backend-hardening-001` at 2026-06-13T18:59:15Z.
+- m4-dl is online and emitted malformed ACK/WORKING messages for the ACK-only check itself, but actual backend audit pickup is not confirmed; do not block eng-m2.
+- eng-m2 state updates are now written by heartbeat and the worker via `/Users/klyexy/.local/bin/agent-state-update`.

@@ -39,6 +39,8 @@ from mcp.server.fastmcp import FastMCP
 NATS_URL = os.getenv("REALM_NATS_URL", "nats://agentnet_secret_token@localhost:4222")
 AGENT_NAME = os.getenv("REALM_AGENT_NAME", "medusa-bridge")
 BLOB_DIR = os.getenv("REALM_BLOB_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".blobs"))
+DEFAULT_REQUEST_TIMEOUT = float(os.getenv("REALM_DEFAULT_REQUEST_TIMEOUT_SECONDS", "86400"))
+WORK_TIMEOUT = float(os.getenv("REALM_WORK_TIMEOUT_SECONDS", "86400"))
 
 _sdk: AgentSDK | None = None
 _current_thread_id: str | None = None
@@ -67,6 +69,8 @@ async def lifespan(server: FastMCP):
             nats_url=NATS_URL,
             metadata={"kind": "mcp-server", "hostname": os.uname().nodename},
             blob_store_dir=BLOB_DIR,
+            default_request_timeout=DEFAULT_REQUEST_TIMEOUT,
+            work_timeout_seconds=WORK_TIMEOUT,
         )
         await _sdk.start()
         _current_thread_id = _sdk.new_thread_id()
