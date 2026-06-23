@@ -12,6 +12,8 @@ REGISTRY_THREAD_STATUS_SUBJECT = "registry.thread_status"
 REGISTRY_THREAD_LIST_SUBJECT = "registry.thread_list"
 REGISTRY_THREAD_MESSAGES_SUBJECT = "registry.thread_messages"
 REGISTRY_MESSAGE_SEARCH_SUBJECT = "registry.message_search"
+REGISTRY_TASK_STATUS_SUBJECT = "registry.task_status"
+REGISTRY_TASK_LIST_SUBJECT = "registry.task_list"
 REGISTRY_METRICS_SUBJECT = "registry.metrics"
 
 

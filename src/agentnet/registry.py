@@ -17,6 +17,8 @@ from agentnet.subjects import (
     REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
     REGISTRY_RESOLVE_KEY_SUBJECT,
     REGISTRY_SEARCH_SUBJECT,
+    REGISTRY_TASK_LIST_SUBJECT,
+    REGISTRY_TASK_STATUS_SUBJECT,
     REGISTRY_THREAD_LIST_SUBJECT,
     REGISTRY_THREAD_MESSAGES_SUBJECT,
     REGISTRY_THREAD_STATUS_SUBJECT,
@@ -550,6 +552,118 @@ async def search_messages_with_client(
     if "error" in data:
         raise RuntimeError(str(data.get("error") or "message_search_failed"))
     return data
+
+
+async def get_task_status(
+    nats_url: str,
+    *,
+    task_id: str,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await get_task_status_with_client(nc, task_id=task_id, timeout=timeout)
+    finally:
+        await nc.drain()
+
+
+async def get_task_status_with_client(
+    nc: NATS,
+    *,
+    task_id: str,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_task_id:
+        raise ValueError("task_id is required")
+    try:
+        response = await nc.request(
+            REGISTRY_TASK_STATUS_SUBJECT,
+            encode_json({"task_id": normalized_task_id}),
+            timeout=timeout,
+        )
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.task_status") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.task_status response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "task_status_failed"))
+    return data
+
+
+async def list_tasks(
+    nats_url: str,
+    *,
+    assignee_account_id: str | None = None,
+    coordinator_account_id: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await list_tasks_with_client(
+            nc,
+            assignee_account_id=assignee_account_id,
+            coordinator_account_id=coordinator_account_id,
+            status=status,
+            limit=limit,
+            timeout=timeout,
+        )
+    finally:
+        await nc.drain()
+
+
+async def list_tasks_with_client(
+    nc: NATS,
+    *,
+    assignee_account_id: str | None = None,
+    coordinator_account_id: str | None = None,
+    status: str | None = None,
+    limit: int = 20,
+    timeout: float = 2.0,
+) -> list[dict[str, Any]]:
+    payload: dict[str, Any] = {"limit": max(1, min(int(limit), 100))}
+    if assignee_account_id:
+        payload["assignee_account_id"] = str(assignee_account_id).strip()
+    if coordinator_account_id:
+        payload["coordinator_account_id"] = str(coordinator_account_id).strip()
+    if status:
+        payload["status"] = str(status).strip()
+    try:
+        response = await nc.request(REGISTRY_TASK_LIST_SUBJECT, encode_json(payload), timeout=timeout)
+    except TimeoutError as exc:
+        raise RuntimeError("Registry did not respond to registry.task_list") from exc
+
+    data: Any = decode_json(response.data)
+    if not isinstance(data, dict):
+        raise RuntimeError("registry.task_list response must be an object")
+    if "error" in data:
+        raise RuntimeError(str(data.get("error") or "task_list_failed"))
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return []
+    return [item for item in tasks if isinstance(item, dict)]
 
 
 async def get_registry_metrics(

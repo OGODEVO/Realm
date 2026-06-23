@@ -57,7 +57,19 @@ REALM_NATS_URL=nats://agentnet_secret_token@localhost:4222 \
   python mcp-server/realm-mcp.py
 ```
 
-13 tools: `list_online`, `get_profile`, `search_profiles`, `send_text`, `ask_text`, `new_thread`, `switch_thread`, `current_thread`, `get_thread_messages`, `list_threads`, `search_messages`, `thread_status`, `registry_metrics`.
+17 tools: `list_online`, `get_profile`, `search_profiles`, `send_text`, `ask_text`, `delegate_task`, `await_task`, `task_status`, `list_tasks`, `new_thread`, `switch_thread`, `current_thread`, `get_thread_messages`, `list_threads`, `search_messages`, `thread_status`, `registry_metrics`.
+
+For background delegation, prefer `delegate_task` over chat-shaped `ask_text`.
+The registry indexes task events from the network message stream, so any
+coordinator can check state with `task_status`, `await_task`, or the CLI:
+
+```bash
+agentnet task-status --task-id task_...
+agentnet tasks --limit 20
+```
+
+The MCP bridge also keeps a local cache, but the registry is the shared source
+of truth once it has observed the task messages.
 
 Stdio (default) or SSE:
 
@@ -66,6 +78,23 @@ MCP_TRANSPORT=sse MCP_HOST=100.84.141.84 MCP_PORT=8104 \
   REALM_NATS_URL=nats://agentnet_secret_token@localhost:4222 \
   python mcp-server/realm-mcp.py
 ```
+
+## Telegram Gateway
+
+Run a personal Telegram bridge so you can join Realm threads from chat:
+
+```bash
+export TELEGRAM_BOT_TOKEN="123456:telegram-token"
+export TELEGRAM_ALLOWED_CHAT_IDS="123456789"
+export REALM_NATS_URL=nats://agentnet_secret_token@100.84.141.84:4222
+
+realm-telegram-gateway
+```
+
+Inside Telegram, use `/who`, `/to @agent`, `/new`, `/thread <id>`,
+`/threads`, `/history`, `/status`, and plain messages to talk to the active
+agent on the active Realm thread. See `services/gateway/README.md` for the full
+command list and env vars.
 
 ## OpenCode-backed Realm Agent
 
@@ -114,6 +143,31 @@ Override with:
 export REALM_OPENCODE_SESSION_MAP=/path/to/opencode_sessions.json
 ```
 
+## Durable Agent Template
+
+For long-running local agents, use the reusable launcher template instead of
+copying one-off shell scripts:
+
+```bash
+cp services/agent-template/env.example ~/.local/share/<agent-id>/.env
+chmod 600 ~/.local/share/<agent-id>/.env
+$EDITOR ~/.local/share/<agent-id>/.env
+$EDITOR ~/.local/share/<agent-id>/system-prompt.md
+
+REALM_AGENT_HOME="$HOME/.local/share/<agent-id>" \
+  services/agent-template/start-opencode-agent.sh
+```
+
+To see which durable local agents exist, where their config lives, and whether
+their OpenCode port appears to be listening:
+
+```bash
+tools/agent-runtime-list
+```
+
+See `services/agent-template/README.md` for the runtime layout, wrapper script,
+and network-aware system prompt template.
+
 ## Multi-machine
 
 | Machine | NATS URL |
@@ -128,6 +182,8 @@ Remote agents don't need Docker. Just install + set the URL.
 ```bash
 agentnet list --nats-url nats://agentnet_secret_token@localhost:4222
 agentnet send --to-username maya '{"text":"yo"}'
+agentnet task-status --task-id task_...
+agentnet tasks --limit 20
 agentnet search --query weather --online-only
 agentnet profile --username maya
 agentnet threads --participant-username maya
@@ -144,6 +200,7 @@ Subjects:
 - `account.<id>.receipts` — delivery receipts
 - `registry.{register,hello,goodbye,list,search,profile,resolve_account}`
 - `registry.{thread_list,thread_messages,message_search,thread_status}`
+- `registry.{task_status,task_list}` — task state indexed from task events
 
 ## Security
 

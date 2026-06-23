@@ -23,10 +23,20 @@ from typing import Any
 
 try:
     from agentnet.sdk import AgentSDK
+    from agentnet.task_protocol import (
+        TASK_ASSIGN,
+        build_task_result,
+        task_type,
+    )
 except ModuleNotFoundError:
     root = Path(__file__).resolve().parents[1]
     sys.path.insert(0, str(root / "src"))
     from agentnet.sdk import AgentSDK
+    from agentnet.task_protocol import (
+        TASK_ASSIGN,
+        build_task_result,
+        task_type,
+    )
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -50,12 +60,26 @@ SYSTEM_PROMPT = os.getenv(
     "REALM_SYSTEM_PROMPT",
     "You are a Realm agent backed by headless OpenCode.",
 )
+EXECUTION_CONTRACT = (
+    "Execution contract: Keep working autonomously until the task is complete "
+    "or genuinely blocked on one specific piece of user input. Every terminal "
+    "answer MUST end with exactly one status marker: [REALM_TASK_COMPLETE] when "
+    "the requested work is finished, or [REALM_TASK_BLOCKED] when user input is "
+    "required. Do not emit either marker while work remains."
+)
 
 SESSION_MAP_PATH = Path(
     os.getenv("REALM_OPENCODE_SESSION_MAP", ".realm/opencode_sessions.json"),
 )
 
 EXPORT_POLL_S  = float(os.getenv("REALM_EXPORT_POLL_S", "3"))
+EXPORT_TIMEOUT = float(os.getenv("REALM_EXPORT_TIMEOUT", "20"))
+EXPORT_FALLBACK_TIMEOUT = float(
+    os.getenv("REALM_EXPORT_FALLBACK_TIMEOUT", "30")
+)
+MAX_AGENT_TURNS = max(1, int(os.getenv("REALM_MAX_AGENT_TURNS", "56")))
+TASK_COMPLETE_MARKER = "[REALM_TASK_COMPLETE]"
+TASK_BLOCKED_MARKER = "[REALM_TASK_BLOCKED]"
 
 STATE_DIR_DEFAULT = os.path.join(
     os.path.expanduser("~"), ".local", "share", AGENT_ID, "state",
@@ -184,6 +208,32 @@ def _progress_json(subtype: str, text: str, task_id: str = "",
 # Task execution
 # ---------------------------------------------------------------------------
 
+async def stop_subprocess(proc: asyncio.subprocess.Process) -> None:
+    """Stop a child process without leaving a zombie behind."""
+    if proc.returncode is not None:
+        return
+    proc.terminate()
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+
+
+async def communicate_with_timeout(
+    proc: asyncio.subprocess.Process, timeout: float
+) -> tuple[bytes, bytes]:
+    """Communicate with a child and always reap it on timeout or cancellation."""
+    try:
+        return await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except TimeoutError:
+        await stop_subprocess(proc)
+        raise
+    except asyncio.CancelledError:
+        await stop_subprocess(proc)
+        raise
+
+
 async def poll_and_stream(session_id: str, sdk: AgentSDK,
                           to_agent: str, thread_id: str,
                           done: asyncio.Event) -> None:
@@ -195,7 +245,13 @@ async def poll_and_stream(session_id: str, sdk: AgentSDK,
                 OPENCODE_BIN, "export", session_id,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE)
-            stdout, _ = await proc.communicate()
+            try:
+                stdout, _ = await communicate_with_timeout(
+                    proc, EXPORT_TIMEOUT
+                )
+            except TimeoutError:
+                await asyncio.sleep(EXPORT_POLL_S)
+                continue
             if proc.returncode != 0:
                 await asyncio.sleep(EXPORT_POLL_S)
                 continue
@@ -206,7 +262,13 @@ async def poll_and_stream(session_id: str, sdk: AgentSDK,
                 await asyncio.sleep(EXPORT_POLL_S)
                 continue
             data = json.loads("\n".join(lines[json_start:]))
-            for msg in (data.get("messages") or []):
+            messages = data.get("messages") or []
+            last_user = max(
+                (i for i, msg in enumerate(messages)
+                 if (msg.get("info") or {}).get("role") == "user"),
+                default=-1,
+            )
+            for msg in messages[last_user + 1:]:
                 if (msg.get("info") or {}).get("role") != "assistant":
                     continue
                 for part in (msg.get("parts") or []):
@@ -216,6 +278,10 @@ async def poll_and_stream(session_id: str, sdk: AgentSDK,
                     text  = part.get("text", "")
                     if not isinstance(text, str) or not text:
                         continue
+                    if ptype == "text":
+                        text = clean_task_answer(text)
+                        if not text:
+                            continue
                     key = f"{ptype}:{hash(text)}"
                     if key in seen:
                         continue
@@ -235,44 +301,49 @@ async def poll_and_stream(session_id: str, sdk: AgentSDK,
         await asyncio.sleep(EXPORT_POLL_S)
 
 
-def _export_text(session_id: str) -> str:
-    """Return the latest assistant text from an export, or ''."""
-    async def _run() -> str:
-        proc = await asyncio.create_subprocess_exec(
-            OPENCODE_BIN, "export", session_id,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE)
-        stdout, _ = await proc.communicate()
-        if proc.returncode != 0:
-            return ""
-        lines = stdout.decode("utf-8", errors="replace").splitlines()
-        json_start = next((i for i, l in enumerate(lines)
-                           if l.strip().startswith("{")), -1)
-        if json_start < 0:
-            return ""
-        try:
-            data = json.loads("\n".join(lines[json_start:]))
-        except json.JSONDecodeError:
-            return ""
-        # ── reproduce existing extract_exported_text logic ──────────────
-        latest: list[str] = []
-        for msg in (data.get("messages") or []):
-            info = msg.get("info") or {}
-            if info.get("role") != "assistant":
+def extract_current_turn_text(data: dict[str, Any]) -> str:
+    """Return assistant text produced after the export's latest user message."""
+    messages = data.get("messages") or []
+    last_user = max(
+        (i for i, msg in enumerate(messages)
+         if (msg.get("info") or {}).get("role") == "user"),
+        default=-1,
+    )
+    chunks: list[str] = []
+    for msg in messages[last_user + 1:]:
+        if (msg.get("info") or {}).get("role") != "assistant":
+            continue
+        for part in msg.get("parts") or []:
+            if not isinstance(part, dict) or part.get("type") != "text":
                 continue
-            cur: list[str] = []
-            for part in (msg.get("parts") or []):
-                if not isinstance(part, dict):
-                    continue
-                if part.get("type") == "text":
-                    t = part.get("text")
-                    if isinstance(t, str):
-                        cur.append(t)
-            if cur:
-                latest = cur
-        return "".join(latest).strip()
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                chunks.append(text)
+    return "\n\n".join(chunks).strip()
 
-    return _run()
+
+async def export_text(session_id: str) -> str:
+    """Return current-turn assistant text from an export, or an empty string."""
+    proc = await asyncio.create_subprocess_exec(
+        OPENCODE_BIN, "export", session_id,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE)
+    try:
+        stdout, _ = await communicate_with_timeout(proc, EXPORT_TIMEOUT)
+    except TimeoutError:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    lines = stdout.decode("utf-8", errors="replace").splitlines()
+    json_start = next((i for i, line in enumerate(lines)
+                       if line.strip().startswith("{")), -1)
+    if json_start < 0:
+        return ""
+    try:
+        data = json.loads("\n".join(lines[json_start:]))
+    except json.JSONDecodeError:
+        return ""
+    return extract_current_turn_text(data)
 
 
 async def ask_opencode(prompt: str, *,
@@ -301,11 +372,16 @@ async def ask_opencode(prompt: str, *,
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
 
     session_id: str | None = None
+    first = b""
     try:
         first = await asyncio.wait_for(proc.stdout.readline(), timeout=30)
         session_id = json.loads(first.decode()).get("sessionID")
     except Exception:
         pass
+
+    if map_key and session_id:
+        session_map[map_key] = session_id
+        save_session_map(session_map)
 
     done = asyncio.Event()
     poll_task: asyncio.Task | None = None
@@ -314,12 +390,20 @@ async def ask_opencode(prompt: str, *,
             poll_and_stream(session_id, sdk, to_agent, thread_id, done))
 
     try:
-        stdout, stderr = await proc.communicate()
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=OPENCODE_TMO
+            )
+        except TimeoutError as exc:
+            await stop_subprocess(proc)
+            raise RuntimeError(
+                f"OpenCode timed out after {OPENCODE_TMO:g} seconds"
+            ) from exc
     finally:
         done.set()
         if poll_task:
-            try: poll_task.cancel()
-            except Exception: pass
+            poll_task.cancel()
+            await asyncio.gather(poll_task, return_exceptions=True)
 
     if proc.returncode != 0:
         raise RuntimeError(
@@ -327,7 +411,8 @@ async def ask_opencode(prompt: str, *,
             f"{stderr.decode('utf-8', errors='replace').strip()}")
 
     chunks: list[str] = []
-    for line in stdout.decode("utf-8", errors="replace").splitlines():
+    raw_stdout = first + stdout
+    for line in raw_stdout.decode("utf-8", errors="replace").splitlines():
         if not (line := line.strip()):
             continue
         try:
@@ -337,24 +422,138 @@ async def ask_opencode(prompt: str, *,
         if t := extract_text_event(event):
             chunks.append(t)
 
-    if map_key and session_id:
-        session_map[map_key] = session_id
-        save_session_map(session_map)
-
     if answer := "".join(chunks).strip():
         return answer
 
-    # ── fallback: poll export forever ─────────────────────────────────────
+    # A completed run can occasionally omit JSON events. Recover from its
+    # export, but never leave the Realm request hanging forever.
     if session_id:
-        await asyncio.sleep(3)
-        while True:
-            if (exported := await _export_text(session_id)):
+        deadline = asyncio.get_running_loop().time() + EXPORT_FALLBACK_TIMEOUT
+        while asyncio.get_running_loop().time() < deadline:
+            if (exported := await export_text(session_id)):
                 return exported
             if read_agent_state().get("state") in ("cancelling", "cancelled"):
                 return "CANCELLED"
             await asyncio.sleep(EXPORT_POLL_S)
+        raise RuntimeError(
+            "OpenCode completed without returning a final text response"
+        )
 
     return "(OpenCode returned no text.)"
+
+
+def is_recoverable_session_error(exc: Exception) -> bool:
+    """Return whether retrying with a fresh backend session is safe enough."""
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc)
+    return (
+        message.startswith("OpenCode exited ")
+        or message == "OpenCode completed without returning a final text response"
+    )
+
+
+def task_answer_status(answer: str) -> str | None:
+    """Read the explicit agent-to-harness completion protocol marker."""
+    has_complete = TASK_COMPLETE_MARKER in answer
+    has_blocked = TASK_BLOCKED_MARKER in answer
+    if has_complete == has_blocked:
+        return None
+    return "complete" if has_complete else "blocked"
+
+
+def clean_task_answer(answer: str) -> str:
+    """Remove harness control markers from user-facing text."""
+    return (
+        str(answer or "")
+        .replace(TASK_COMPLETE_MARKER, "")
+        .replace(TASK_BLOCKED_MARKER, "")
+        .strip()
+    )
+
+
+async def ask_opencode_resilient(
+    prompt: str,
+    *,
+    realm_thread_id: str | None,
+    session_map: dict[str, str],
+    sdk: AgentSDK | None = None,
+    to_agent: str = "",
+    thread_id: str = "",
+) -> str:
+    """Retry once with a fresh OpenCode session while preserving the Realm thread."""
+    map_key = realm_thread_id or ""
+    existing_session = session_map.get(map_key)
+    try:
+        return await ask_opencode(
+            prompt,
+            realm_thread_id=realm_thread_id,
+            session_map=session_map,
+            sdk=sdk,
+            to_agent=to_agent,
+            thread_id=thread_id,
+        )
+    except Exception as exc:
+        if not existing_session or not map_key or not is_recoverable_session_error(exc):
+            raise
+
+    # Keep the public Realm thread, but detach its broken OpenCode conversation.
+    session_map.pop(map_key, None)
+    save_session_map(session_map)
+    if sdk and to_agent and thread_id:
+        try:
+            await sdk.send_text(
+                to_agent,
+                _progress_json(
+                    "status",
+                    "Backend session recovered; retrying on the same thread.",
+                    visible=False,
+                ),
+                thread_id=thread_id,
+            )
+        except Exception:
+            pass
+    return await ask_opencode(
+        prompt,
+        realm_thread_id=realm_thread_id,
+        session_map=session_map,
+        sdk=sdk,
+        to_agent=to_agent,
+        thread_id=thread_id,
+    )
+
+
+async def ask_opencode_until_complete(
+    prompt: str,
+    *,
+    realm_thread_id: str | None,
+    session_map: dict[str, str],
+    sdk: AgentSDK | None = None,
+    to_agent: str = "",
+    thread_id: str = "",
+) -> str:
+    """Drive the agent until it explicitly reports completion or blockage."""
+    next_prompt = prompt
+    for _ in range(MAX_AGENT_TURNS):
+        answer = await ask_opencode_resilient(
+            next_prompt,
+            realm_thread_id=realm_thread_id,
+            session_map=session_map,
+            sdk=sdk,
+            to_agent=to_agent,
+            thread_id=thread_id,
+        )
+        if task_answer_status(answer) is not None:
+            return clean_task_answer(answer)
+        next_prompt = (
+            "The task is still active because your previous turn had no Realm "
+            "completion status. Continue executing autonomously. When finished, "
+            f"end with {TASK_COMPLETE_MARKER}; if one specific user input blocks "
+            f"you, ask for it and end with {TASK_BLOCKED_MARKER}."
+        )
+    raise RuntimeError(
+        f"Agent exceeded {MAX_AGENT_TURNS} turns without reporting complete or blocked"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -374,7 +573,9 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
     task_id = ""
     if isinstance(msg.payload, dict):
         task_id = str(msg.payload.get("task_id") or "")
-    should_process = (msg.kind == "request" or
+    incoming_task_type = task_type(msg.payload)
+    is_task_assignment = incoming_task_type == TASK_ASSIGN
+    should_process = (msg.kind == "request" or is_task_assignment or
                       (msg.kind == "direct" and is_from_teammate(msg)))
 
     # -- CANCEL (any kind) ---------------------------------------------------
@@ -443,24 +644,45 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
 
     # -- execute -------------------------------------------------------------
     try:
-        answer = await ask_opencode(
-            f"{SYSTEM_PROMPT}\n\nRequest:\n{text}",
+        answer = await ask_opencode_until_complete(
+            f"{SYSTEM_PROMPT}\n\n{EXECUTION_CONTRACT}\n\nRequest:\n{text}",
             realm_thread_id=msg.thread_id,
             session_map=session_map,
             sdk=sdk, to_agent=to, thread_id=msg.thread_id)
         await update_agent_state("done", task_id=task_id,
                                  last_action=answer[:200])
-        payload = _build_reply(answer, "answered", task_id)
+        payload = (
+            build_task_result(
+                task_id=task_id,
+                text=answer,
+                status="completed",
+                metadata={"agent": USERNAME, "model": OPENCODE_MODEL},
+            )
+            if is_task_assignment
+            else _build_reply(answer, "answered", task_id)
+        )
     except Exception as exc:
         await update_agent_state("failed", task_id=task_id,
                                  error=str(exc)[:500])
-        payload = _build_reply(f"OpenCode handler failed: {exc}", "error",
-                               task_id)
+        payload = (
+            build_task_result(
+                task_id=task_id,
+                text=f"OpenCode handler failed: {exc}",
+                status="failed",
+                metadata={"agent": USERNAME, "model": OPENCODE_MODEL},
+            )
+            if is_task_assignment
+            else _build_reply(f"OpenCode handler failed: {exc}", "error",
+                              task_id)
+        )
 
     if msg.kind == "request":
         await sdk.node.reply(msg, payload, thread_id=msg.thread_id)
     elif to:
-        await sdk.send_text(to, json.dumps(payload), thread_id=msg.thread_id)
+        if is_task_assignment:
+            await sdk.send_json(to, payload, thread_id=msg.thread_id)
+        else:
+            await sdk.send_text(to, json.dumps(payload), thread_id=msg.thread_id)
 
 
 # ---------------------------------------------------------------------------

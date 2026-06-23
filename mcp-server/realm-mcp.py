@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Realm MCP Server — exposes AgentNet as MCP tools for AI agents.
 
-Every server instance maintains a *current thread*. All sends/replies
-default to that thread and auto-chain parent_message_id. The agent
-feels like it's having one ongoing conversation.
+Every server instance can act as a coordinator harness. Chat tools still
+support current-thread conversation, but delegated work should use the task
+tools so background agents can report terminal completion later.
 
 Tools:
   current_thread         — see which thread is active
@@ -14,6 +14,10 @@ Tools:
   search_profiles <...>  — find agents by keyword/capability
   send_text <to> <text>  — fire-and-forget message (current thread)
   ask_text <to> <text>   — send and wait for reply (current thread)
+  delegate_task          — assign background work to another agent
+  await_task             — wait for completed/blocked/failed task result
+  task_status            — inspect a known task
+  list_tasks             — list recent delegated tasks
   get_thread_messages    — read current thread history
   list_threads           — all threads you're part of
   search_messages <...>  — search across all message history
@@ -31,9 +35,20 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from agentnet.sdk import AgentSDK
+from agentnet.schema import AgentMessage
+from agentnet.task_protocol import (
+    TASK_BLOCKED,
+    TASK_FAILED,
+    TASK_RESULT,
+    TERMINAL_TASK_TYPES,
+    decode_task_payload,
+    task_id_from_payload,
+    task_type,
+)
 from mcp.server.fastmcp import FastMCP
 
 NATS_URL = os.getenv("REALM_NATS_URL", "nats://agentnet_secret_token@localhost:4222")
@@ -45,6 +60,8 @@ WORK_TIMEOUT = float(os.getenv("REALM_WORK_TIMEOUT_SECONDS", "86400"))
 _sdk: AgentSDK | None = None
 _current_thread_id: str | None = None
 _last_message_id: str | None = None
+_task_store: "TaskStore | None" = None
+_task_condition: asyncio.Condition | None = None
 
 
 def _get_sdk() -> AgentSDK:
@@ -57,9 +74,129 @@ def _json(obj: Any) -> str:
     return json.dumps(obj, indent=2, default=str, ensure_ascii=False)
 
 
+def _decode_nested_json_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        text = payload.get("text")
+        if isinstance(text, str):
+            stripped = text.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    decoded = json.loads(stripped)
+                except json.JSONDecodeError:
+                    return payload
+                if isinstance(decoded, dict):
+                    return decoded
+    return payload
+
+
+def _status_for_task_payload(payload: Any) -> str:
+    payload_type = task_type(payload)
+    if payload_type == TASK_RESULT:
+        return str(payload.get("status") or "completed") if isinstance(payload, dict) else "completed"
+    if payload_type == TASK_BLOCKED:
+        return "blocked"
+    if payload_type == TASK_FAILED:
+        return "failed"
+    if payload_type:
+        return payload_type.removeprefix("task.")
+    return "unknown"
+
+
+class TaskStore:
+    """Small persistent ledger for MCP-initiated background tasks."""
+
+    def __init__(self, path: str) -> None:
+        self.path = Path(path).expanduser()
+        self._lock = asyncio.Lock()
+        self._tasks: dict[str, dict[str, Any]] = {}
+
+    async def load(self) -> None:
+        async with self._lock:
+            try:
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError):
+                return
+            tasks = raw.get("tasks") if isinstance(raw, dict) else None
+            if isinstance(tasks, dict):
+                self._tasks = {
+                    str(task_id): dict(value)
+                    for task_id, value in tasks.items()
+                    if isinstance(value, dict)
+                }
+
+    async def save(self) -> None:
+        async with self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"tasks": self._tasks}, indent=2, sort_keys=True, default=str),
+                encoding="utf-8",
+            )
+            tmp.replace(self.path)
+
+    async def upsert(self, task_id: str, **fields: Any) -> dict[str, Any]:
+        async with self._lock:
+            current = dict(self._tasks.get(task_id, {}))
+            current.update({k: v for k, v in fields.items() if v is not None})
+            current["task_id"] = task_id
+            self._tasks[task_id] = current
+        await self.save()
+        return current
+
+    async def get(self, task_id: str) -> dict[str, Any] | None:
+        async with self._lock:
+            current = self._tasks.get(task_id)
+            return dict(current) if current is not None else None
+
+    async def list(self, limit: int = 20) -> list[dict[str, Any]]:
+        async with self._lock:
+            rows = [dict(value) for value in self._tasks.values()]
+        rows.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+        return rows[: max(1, min(100, int(limit)))]
+
+
+async def _notify_task_waiters() -> None:
+    condition = _task_condition
+    if condition is None:
+        return
+    async with condition:
+        condition.notify_all()
+
+
+async def _record_inbound_task_event(message: AgentMessage) -> None:
+    store = _task_store
+    if store is None:
+        return
+    payload = _decode_nested_json_payload(message.payload)
+    decoded = decode_task_payload(payload)
+    if decoded is None:
+        return
+    task_id = task_id_from_payload(decoded)
+    if not task_id:
+        return
+    status = _status_for_task_payload(decoded)
+    await store.upsert(
+        task_id,
+        status=status,
+        type=task_type(decoded),
+        text=str(decoded.get("text") or ""),
+        payload=dict(decoded),
+        thread_id=message.thread_id,
+        from_agent=message.from_agent,
+        from_account_id=message.from_account_id,
+        message_id=message.message_id,
+        updated_at=str(decoded.get("finished_at") or decoded.get("event_at") or ""),
+    )
+    await _notify_task_waiters()
+
+
+async def _handle_inbox_message(message: AgentMessage) -> None:
+    await _record_inbound_task_event(message)
+
+
 @asynccontextmanager
 async def lifespan(server: FastMCP):
-    global _sdk, _current_thread_id, _last_message_id
+    global _sdk, _current_thread_id, _last_message_id, _task_store, _task_condition
     try:
         _sdk = AgentSDK(
             agent_id=f"mcp_{AGENT_NAME}",
@@ -72,6 +209,10 @@ async def lifespan(server: FastMCP):
             default_request_timeout=DEFAULT_REQUEST_TIMEOUT,
             work_timeout_seconds=WORK_TIMEOUT,
         )
+        _task_store = TaskStore(os.getenv("REALM_TASK_LEDGER", os.path.join(BLOB_DIR, "tasks.json")))
+        _task_condition = asyncio.Condition()
+        await _task_store.load()
+        _sdk.receive(_handle_inbox_message)
         await _sdk.start()
         _current_thread_id = _sdk.new_thread_id()
         _last_message_id = None
@@ -87,14 +228,16 @@ async def lifespan(server: FastMCP):
             _sdk = None
             _current_thread_id = None
             _last_message_id = None
+            _task_store = None
+            _task_condition = None
 
 
 mcp = FastMCP(
     name="realm-mcp",
     instructions=(
         "Realm / AgentNet MCP bridge. "
-        "You are always in a conversation thread — send_text and ask_text default to it. "
-        "Replies auto-chain. Use new_thread() to start a fresh conversation."
+        "Use delegate_task for background work on other agents, await_task/task_status "
+        "for completion, and ask_text only for synchronous conversation-style requests."
     ),
     lifespan=lifespan,
     host=os.getenv("MCP_HOST", "127.0.0.1"),
@@ -221,6 +364,123 @@ async def ask_text(
         "reply_text": result.text,
         "reply_data": result.data,
     })
+
+
+@mcp.tool()
+async def delegate_task(
+    to: str,
+    text: str,
+    title: str | None = None,
+    thread_id: str | None = None,
+    wait: bool = False,
+    timeout: float = 86400.0,
+) -> str:
+    """Assign background work to another Realm agent.
+
+    to: target agent (@username, acct_..., or capability:name)
+    text: concrete task instructions
+    title: optional short label for the task
+    thread_id: optional audit thread; defaults to current thread
+    wait: when true, block until the assigned agent returns a terminal task event
+    timeout: seconds to wait when wait=true
+    """
+    global _last_message_id
+    sdk = _get_sdk()
+    store = _task_store
+    if store is None:
+        raise RuntimeError("task store not initialized")
+    tid = thread_id or _current_thread_id or sdk.new_thread_id()
+    result = await sdk.delegate_task(
+        to,
+        text,
+        title=title,
+        thread_id=tid,
+        parent_message_id=_last_message_id,
+    )
+    task_id = str(result.trace_id or "")
+    _last_message_id = result.message_id
+    row = await store.upsert(
+        task_id,
+        status="assigned",
+        type="task.assign",
+        target=to,
+        title=title,
+        text=text,
+        payload=result.data,
+        thread_id=tid,
+        message_id=result.message_id,
+        created_at=str((result.data or {}).get("created_at") if isinstance(result.data, dict) else ""),
+        updated_at=str((result.data or {}).get("created_at") if isinstance(result.data, dict) else ""),
+    )
+    if wait:
+        return await await_task(task_id, timeout=timeout)
+    return _json({"ok": True, **row})
+
+
+@mcp.tool()
+async def task_status(task_id: str) -> str:
+    """Inspect one delegated background task by task_id."""
+    sdk = _get_sdk()
+    store = _task_store
+    if store is None:
+        raise RuntimeError("task store not initialized")
+    try:
+        return _json({"ok": True, "source": "registry", **await sdk.task_status(task_id)})
+    except Exception:
+        pass
+    row = await store.get(task_id)
+    if row is None:
+        return _json({"ok": False, "error": "task_not_found", "task_id": task_id})
+    return _json({"ok": True, "source": "local_ledger", **row})
+
+
+@mcp.tool()
+async def list_tasks(limit: int = 20) -> str:
+    """List recent delegated tasks known to this MCP harness."""
+    sdk = _get_sdk()
+    store = _task_store
+    if store is None:
+        raise RuntimeError("task store not initialized")
+    try:
+        return _json({"ok": True, "source": "registry", "tasks": await sdk.list_tasks(limit=limit)})
+    except Exception:
+        return _json({"ok": True, "source": "local_ledger", "tasks": await store.list(limit=limit)})
+
+
+@mcp.tool()
+async def await_task(task_id: str, timeout: float = 86400.0) -> str:
+    """Wait until a delegated task reports completed, blocked, or failed."""
+    sdk = _get_sdk()
+    store = _task_store
+    condition = _task_condition
+    if store is None or condition is None:
+        raise RuntimeError("task store not initialized")
+    deadline = asyncio.get_running_loop().time() + max(0.1, float(timeout))
+    while True:
+        try:
+            registry_row = await sdk.task_status(task_id, timeout=2.0)
+            task = registry_row.get("task") if isinstance(registry_row.get("task"), dict) else registry_row
+            status = str(task.get("status") or "") if isinstance(task, dict) else ""
+            payload_type = str(task.get("type") or "") if isinstance(task, dict) else ""
+            if payload_type in TERMINAL_TASK_TYPES or status in {"completed", "blocked", "failed"}:
+                return _json({"ok": status == "completed", "source": "registry", **task})
+        except Exception:
+            pass
+        row = await store.get(task_id)
+        if row is None:
+            row = {"task_id": task_id, "status": "unknown"}
+        local_payload_type = str(row.get("type") or "")
+        local_status = str(row.get("status") or "")
+        if local_payload_type in TERMINAL_TASK_TYPES or local_status in {"completed", "blocked", "failed"}:
+            return _json({"ok": local_status == "completed", "source": "local_ledger", **row})
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return _json({"ok": False, "error": "task_timeout", **row})
+        async with condition:
+            try:
+                await asyncio.wait_for(condition.wait(), timeout=min(remaining, 5.0))
+            except asyncio.TimeoutError:
+                pass
 
 
 # ---------------------------------------------------------------------------

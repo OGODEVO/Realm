@@ -23,6 +23,7 @@ dependencies = [
 
 [project.scripts]
 agentnet = "agentnet.__main__:main"
+realm-telegram-gateway = "agentnet.telegram_gateway:main"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

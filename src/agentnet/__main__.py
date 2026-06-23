@@ -21,9 +21,11 @@ from agentnet.node import AgentNode
 from agentnet.registry import (
     get_registry_metrics,
     get_profile,
+    get_task_status,
     get_thread_messages,
     get_thread_status,
     list_online_agents,
+    list_tasks,
     list_threads,
     search_messages,
     search_profiles,
@@ -557,6 +559,63 @@ async def _run_message_search(
 
 
 # ──────────────────────────────────────────────
+# task status/list
+# ──────────────────────────────────────────────
+
+async def _run_task_status(nats_url: str, task_id: str, timeout: float) -> int:
+    with console.status("[info]Fetching task status…[/]", spinner="dots"):
+        result = await get_task_status(nats_url, task_id=task_id, timeout=timeout)
+    console.print(RichJSON(json.dumps(result, indent=2)))
+    return 0
+
+
+async def _run_task_list(
+    nats_url: str,
+    assignee_account_id: str | None,
+    coordinator_account_id: str | None,
+    status: str | None,
+    limit: int,
+    timeout: float,
+) -> int:
+    with console.status("[info]Fetching tasks…[/]", spinner="dots"):
+        rows = await list_tasks(
+            nats_url,
+            assignee_account_id=assignee_account_id,
+            coordinator_account_id=coordinator_account_id,
+            status=status,
+            limit=limit,
+            timeout=timeout,
+        )
+    if not rows:
+        console.print("[dim]No matching tasks found[/]")
+        return 0
+    table = Table(
+        title=f"[info]Tasks[/]  [dim]({len(rows)})[/]",
+        border_style="bright_black",
+        title_justify="left",
+        show_edge=True,
+        expand=True,
+    )
+    table.add_column("Task", style="field.value", no_wrap=True)
+    table.add_column("Status", style="field.value", no_wrap=True)
+    table.add_column("Assignee", style="field.value", no_wrap=True)
+    table.add_column("Coordinator", style="field.value", no_wrap=True)
+    table.add_column("Updated", style="dim", no_wrap=True)
+    table.add_column("Text", style="field.value")
+    for row in rows:
+        table.add_row(
+            str(row.get("task_id") or "—"),
+            str(row.get("status") or "—"),
+            str(row.get("assignee_account_id") or "—"),
+            str(row.get("coordinator_account_id") or "—"),
+            str(row.get("updated_at") or "—"),
+            str(row.get("text") or row.get("assigned_text") or "—")[:120],
+        )
+    console.print(table)
+    return 0
+
+
+# ──────────────────────────────────────────────
 # send
 # ──────────────────────────────────────────────
 
@@ -970,6 +1029,27 @@ def main() -> int:
     message_search_parser.add_argument("--cursor", help="Pagination cursor from prior response")
     message_search_parser.add_argument("--timeout", type=float, default=2.0)
 
+    task_status_parser = subparsers.add_parser(
+        "task-status",
+        help="Inspect registry task state",
+        formatter_class=_RichHelpFormatter,
+    )
+    task_status_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    task_status_parser.add_argument("--task-id", required=True)
+    task_status_parser.add_argument("--timeout", type=float, default=2.0)
+
+    tasks_parser = subparsers.add_parser(
+        "tasks",
+        help="List registry task state",
+        formatter_class=_RichHelpFormatter,
+    )
+    tasks_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    tasks_parser.add_argument("--assignee-account-id")
+    tasks_parser.add_argument("--coordinator-account-id")
+    tasks_parser.add_argument("--status")
+    tasks_parser.add_argument("--limit", type=int, default=20)
+    tasks_parser.add_argument("--timeout", type=float, default=2.0)
+
     send_parser = subparsers.add_parser("send", help="Send a message", formatter_class=_RichHelpFormatter)
     send_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     group = send_parser.add_mutually_exclusive_group(required=True)
@@ -1099,6 +1179,19 @@ def main() -> int:
                     limit=args.limit,
                     cursor=args.cursor,
                     timeout=args.timeout,
+                )
+            )
+        if args.command == "task-status":
+            return asyncio.run(_run_task_status(args.nats_url, args.task_id, args.timeout))
+        if args.command == "tasks":
+            return asyncio.run(
+                _run_task_list(
+                    args.nats_url,
+                    args.assignee_account_id,
+                    args.coordinator_account_id,
+                    args.status,
+                    args.limit,
+                    args.timeout,
                 )
             )
         if args.command == "send":

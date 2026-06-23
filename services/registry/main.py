@@ -41,10 +41,23 @@ from agentnet.subjects import (
     REGISTRY_RESOLVE_ACCOUNT_SUBJECT,
     REGISTRY_RESOLVE_KEY_SUBJECT,
     REGISTRY_SEARCH_SUBJECT,
+    REGISTRY_TASK_LIST_SUBJECT,
+    REGISTRY_TASK_STATUS_SUBJECT,
     REGISTRY_THREAD_LIST_SUBJECT,
     REGISTRY_THREAD_MESSAGES_SUBJECT,
     REGISTRY_THREAD_STATUS_SUBJECT,
     account_inbox_subject,
+)
+from agentnet.task_protocol import (
+    TASK_ASSIGN,
+    TASK_BLOCKED,
+    TASK_FAILED,
+    TASK_PROGRESS,
+    TASK_RESULT,
+    TERMINAL_TASK_TYPES,
+    decode_task_payload,
+    task_id_from_payload,
+    task_type,
 )
 from agentnet.utils import decode_json, encode_json, new_ulid, utc_now_iso
 
@@ -151,6 +164,91 @@ def _decode_cursor(cursor: str | None) -> tuple[datetime | None, str | None]:
     if sent_at is None or message_id is None:
         return None, None
     return sent_at, message_id
+
+
+def _decode_nested_json_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        text = payload.get("text")
+        if isinstance(text, str):
+            stripped = text.strip()
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    decoded = json.loads(stripped)
+                except json.JSONDecodeError:
+                    return payload
+                if isinstance(decoded, dict):
+                    return decoded
+    return payload
+
+
+def _task_status_from_payload(payload: dict[str, Any]) -> str:
+    payload_type = task_type(payload)
+    if payload_type == TASK_ASSIGN:
+        return "assigned"
+    if payload_type == TASK_PROGRESS:
+        return "working"
+    if payload_type == TASK_RESULT:
+        return str(payload.get("status") or "completed")
+    if payload_type == TASK_BLOCKED:
+        return "blocked"
+    if payload_type == TASK_FAILED:
+        return "failed"
+    return payload_type.removeprefix("task.") or "unknown"
+
+
+def _task_event_from_message_row(row: dict[str, Any]) -> dict[str, Any] | None:
+    payload = _decode_nested_json_payload(row.get("payload"))
+    decoded = decode_task_payload(payload)
+    if decoded is None:
+        return None
+    task_id = task_id_from_payload(decoded)
+    if not task_id:
+        return None
+    payload_dict = dict(decoded)
+    return {
+        "task_id": task_id,
+        "type": task_type(payload_dict),
+        "status": _task_status_from_payload(payload_dict),
+        "text": str(payload_dict.get("text") or ""),
+        "title": str(payload_dict.get("title") or "") or None,
+        "thread_id": str(row.get("thread_id") or "") or None,
+        "message_id": str(row.get("message_id") or "") or None,
+        "parent_message_id": str(row.get("parent_message_id") or "") or None,
+        "from_account_id": str(row.get("from_account_id") or "") or None,
+        "to_account_id": str(row.get("to_account_id") or "") or None,
+        "to_agent": str(row.get("to_agent") or "") or None,
+        "sent_at": str(row.get("sent_at") or "") or None,
+        "received_at": str(row.get("received_at") or "") or None,
+        "payload": payload_dict,
+    }
+
+
+def _task_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not events:
+        return None
+    ordered = sorted(events, key=lambda item: (str(item.get("sent_at") or ""), str(item.get("message_id") or "")))
+    first = ordered[0]
+    latest = ordered[-1]
+    assignment = next((event for event in ordered if event.get("type") == TASK_ASSIGN), first)
+    terminal = next((event for event in reversed(ordered) if str(event.get("type") or "") in TERMINAL_TASK_TYPES), None)
+    effective = terminal or latest
+    return {
+        "task_id": latest.get("task_id"),
+        "status": effective.get("status"),
+        "type": effective.get("type"),
+        "title": assignment.get("title"),
+        "text": effective.get("text"),
+        "assigned_text": assignment.get("text"),
+        "thread_id": effective.get("thread_id") or assignment.get("thread_id"),
+        "assignee_account_id": assignment.get("to_account_id"),
+        "coordinator_account_id": assignment.get("from_account_id"),
+        "created_at": assignment.get("sent_at") or assignment.get("received_at"),
+        "updated_at": effective.get("sent_at") or effective.get("received_at"),
+        "message_id": effective.get("message_id"),
+        "terminal": terminal is not None,
+        "event_count": len(ordered),
+        "latest_event": effective,
+    }
 
 
 class PostgresSessionStore:
@@ -826,6 +924,76 @@ class PostgresSessionStore:
             next_cursor = _encode_cursor(sent_at=last_row["sent_at"], message_id=str(last_row["message_id"]))
         return messages, next_cursor
 
+    async def get_task_status(self, *, task_id: str) -> dict[str, Any] | None:
+        if self._pool is None:
+            raise RuntimeError("Postgres session store is not started")
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return None
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id,
+                to_agent, kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
+            FROM agent_messages
+            WHERE payload::text LIKE ('%' || $1 || '%')
+            ORDER BY sent_at ASC, message_id ASC
+            LIMIT 500
+            """,
+            normalized_task_id,
+        )
+        events = [
+            event
+            for row in rows
+            if (event := _task_event_from_message_row(self._row_to_message(row))) is not None
+        ]
+        return _task_snapshot_from_events(events)
+
+    async def list_tasks(
+        self,
+        *,
+        assignee_account_id: str | None,
+        coordinator_account_id: str | None,
+        status: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if self._pool is None:
+            raise RuntimeError("Postgres session store is not started")
+        safe_limit = max(1, min(int(limit), 100))
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                message_id, thread_id, parent_message_id, from_account_id, from_session_tag, to_account_id,
+                to_agent, kind, schema_version, idempotency_key, payload, trace_id, sent_at, received_at, status, metadata
+            FROM agent_messages
+            WHERE payload::text LIKE '%task_%'
+            ORDER BY sent_at DESC, message_id DESC
+            LIMIT $1
+            """,
+            max(safe_limit * 50, safe_limit),
+        )
+        events_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            event = _task_event_from_message_row(self._row_to_message(row))
+            if event is not None:
+                events_by_task[str(event["task_id"])].append(event)
+        snapshots = [
+            snapshot
+            for events in events_by_task.values()
+            if (snapshot := _task_snapshot_from_events(events)) is not None
+        ]
+        normalized_assignee = str(assignee_account_id or "").strip()
+        normalized_coordinator = str(coordinator_account_id or "").strip()
+        normalized_status = str(status or "").strip()
+        if normalized_assignee:
+            snapshots = [item for item in snapshots if item.get("assignee_account_id") == normalized_assignee]
+        if normalized_coordinator:
+            snapshots = [item for item in snapshots if item.get("coordinator_account_id") == normalized_coordinator]
+        if normalized_status:
+            snapshots = [item for item in snapshots if item.get("status") == normalized_status]
+        snapshots.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+        return snapshots[:safe_limit]
+
     async def _persist_message_with_conn(self, conn: Any, message: AgentMessage, received_at: datetime) -> bool:
         message_id = str(message.message_id or "").strip()
         if not message_id:
@@ -1229,6 +1397,14 @@ class RegistryService:
         await self._nc.subscribe(
             REGISTRY_MESSAGE_SEARCH_SUBJECT,
             cb=self._instrument_handler("message_search", self._on_message_search),
+        )
+        await self._nc.subscribe(
+            REGISTRY_TASK_STATUS_SUBJECT,
+            cb=self._instrument_handler("task_status", self._on_task_status),
+        )
+        await self._nc.subscribe(
+            REGISTRY_TASK_LIST_SUBJECT,
+            cb=self._instrument_handler("task_list", self._on_task_list),
         )
         await self._nc.subscribe(
             REGISTRY_METRICS_SUBJECT,
@@ -1754,6 +1930,55 @@ class RegistryService:
         }
         await self._nc.publish(msg.reply, encode_json(response))
 
+    async def _on_task_status(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        data = decode_json(msg.data)
+        if not isinstance(data, dict):
+            await self._nc.publish(msg.reply, encode_json({"error": "task_status payload must be an object"}))
+            return
+        task_id = str(data.get("task_id") or "").strip()
+        if not task_id:
+            await self._nc.publish(msg.reply, encode_json({"error": "task_id is required"}))
+            return
+        try:
+            task = await self._get_task_status(task_id)
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed task status lookup task_id=%s", task_id)
+            await self._nc.publish(msg.reply, encode_json({"error": "task_status_failed"}))
+            return
+        if task is None:
+            await self._nc.publish(msg.reply, encode_json({"error": "not_found"}))
+            return
+        await self._nc.publish(msg.reply, encode_json({"task": task, "generated_at": utc_now_iso()}))
+
+    async def _on_task_list(self, msg: Msg) -> None:
+        if not msg.reply or not self._nc:
+            return
+        data = decode_json(msg.data)
+        if not isinstance(data, dict):
+            await self._nc.publish(msg.reply, encode_json({"error": "task_list payload must be an object"}))
+            return
+        try:
+            limit = int(data.get("limit") or 20)
+        except (TypeError, ValueError):
+            limit = 20
+        try:
+            tasks = await self._list_tasks(
+                assignee_account_id=str(data.get("assignee_account_id") or "").strip() or None,
+                coordinator_account_id=str(data.get("coordinator_account_id") or "").strip() or None,
+                status=str(data.get("status") or "").strip() or None,
+                limit=limit,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed task list lookup")
+            await self._nc.publish(msg.reply, encode_json({"error": "task_list_failed"}))
+            return
+        await self._nc.publish(
+            msg.reply,
+            encode_json({"tasks": tasks, "limit": max(1, min(limit, 100)), "generated_at": utc_now_iso()}),
+        )
+
     async def _on_thread_list(self, msg: Msg) -> None:
         if not msg.reply or not self._nc:
             return
@@ -2198,6 +2423,57 @@ class RegistryService:
             ],
             "online": bool(sessions),
         }
+
+    async def _get_task_status(self, task_id: str) -> dict[str, Any] | None:
+        normalized_task_id = str(task_id or "").strip()
+        if not normalized_task_id:
+            return None
+        if self._store is not None:
+            return await self._store.get_task_status(task_id=normalized_task_id)
+        events = [
+            event
+            for row in self._local_messages.values()
+            if (event := _task_event_from_message_row(row)) is not None
+            and event.get("task_id") == normalized_task_id
+        ]
+        return _task_snapshot_from_events(events)
+
+    async def _list_tasks(
+        self,
+        *,
+        assignee_account_id: str | None,
+        coordinator_account_id: str | None,
+        status: str | None,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        if self._store is not None:
+            return await self._store.list_tasks(
+                assignee_account_id=assignee_account_id,
+                coordinator_account_id=coordinator_account_id,
+                status=status,
+                limit=limit,
+            )
+        events_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for row in self._local_messages.values():
+            event = _task_event_from_message_row(row)
+            if event is not None:
+                events_by_task[str(event["task_id"])].append(event)
+        snapshots = [
+            snapshot
+            for events in events_by_task.values()
+            if (snapshot := _task_snapshot_from_events(events)) is not None
+        ]
+        normalized_assignee = str(assignee_account_id or "").strip()
+        normalized_coordinator = str(coordinator_account_id or "").strip()
+        normalized_status = str(status or "").strip()
+        if normalized_assignee:
+            snapshots = [item for item in snapshots if item.get("assignee_account_id") == normalized_assignee]
+        if normalized_coordinator:
+            snapshots = [item for item in snapshots if item.get("coordinator_account_id") == normalized_coordinator]
+        if normalized_status:
+            snapshots = [item for item in snapshots if item.get("status") == normalized_status]
+        snapshots.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
+        return snapshots[: max(1, min(int(limit), 100))]
 
     async def _get_thread_status(self, thread_id: str) -> dict[str, Any] | None:
         normalized_thread_id = str(thread_id or "").strip()

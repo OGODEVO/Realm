@@ -10,8 +10,9 @@ from typing import Any
 from agentnet.blob import BlobRef, LocalBlobStore
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
-from agentnet.registry import get_registry_metrics, get_thread_status
+from agentnet.registry import get_registry_metrics, get_task_status, get_thread_status, list_tasks
 from agentnet.schema import AgentInfo, AgentMessage
+from agentnet.task_protocol import build_task_assign, new_task_id
 from agentnet.utils import utc_now_iso
 
 ReceiveHandler = Callable[[AgentMessage], Awaitable[None]]
@@ -1132,6 +1133,27 @@ class AgentSDK:
     async def registry_metrics(self, timeout: float = 2.0) -> dict[str, Any]:
         return await get_registry_metrics(self._node.nats_url, timeout=timeout)
 
+    async def task_status(self, task_id: str, *, timeout: float = 2.0) -> dict[str, Any]:
+        return await get_task_status(self._node.nats_url, task_id=task_id, timeout=timeout)
+
+    async def list_tasks(
+        self,
+        *,
+        assignee_account_id: str | None = None,
+        coordinator_account_id: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
+        timeout: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        return await list_tasks(
+            self._node.nats_url,
+            assignee_account_id=assignee_account_id,
+            coordinator_account_id=coordinator_account_id,
+            status=status,
+            limit=limit,
+            timeout=timeout,
+        )
+
     async def send_text(
         self,
         to: str,
@@ -1239,6 +1261,44 @@ class AgentSDK:
             data=reply.payload,
             trace_id=reply.trace_id,
         )
+
+    async def delegate_task(
+        self,
+        to: str,
+        text: str,
+        *,
+        task_id: str | None = None,
+        title: str | None = None,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
+        idempotency_key: str | None = None,
+        require_delivery_ack: bool = True,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SDKResult:
+        effective_task_id = str(task_id or "").strip() or new_task_id()
+        payload = build_task_assign(
+            task_id=effective_task_id,
+            text=text,
+            coordinator=self.username or self.account_id,
+            title=title,
+            metadata=metadata,
+        )
+        result = await self.send_json(
+            to,
+            payload,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=idempotency_key or effective_task_id,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        result.data = payload
+        result.text = text
+        result.trace_id = effective_task_id
+        return result
 
     def _normalize_thread_id(self, thread_id: str | None) -> str:
         value = str(thread_id or "").strip()

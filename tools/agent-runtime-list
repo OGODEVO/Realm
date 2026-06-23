@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""List local durable Realm/OpenCode agent runtimes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import socket
+import subprocess
+from pathlib import Path
+
+
+SECRET_MARKERS = ("TOKEN", "PASSWORD", "SECRET", "KEY")
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip('"').strip("'")
+        values[key.strip()] = value
+    return values
+
+
+def is_secret(key: str) -> bool:
+    upper = key.upper()
+    return any(marker in upper for marker in SECRET_MARKERS)
+
+
+def port_open(host: str, port: str) -> bool:
+    try:
+        port_num = int(port)
+    except (TypeError, ValueError):
+        return False
+    try:
+        with socket.create_connection((host, port_num), timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+
+def tmux_sessions() -> set[str] | None:
+    try:
+        proc = subprocess.run(
+            ["tmux", "list-sessions", "-F", "#{session_name}"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+
+
+def load_state(agent_home: Path, agent_id: str) -> dict[str, str]:
+    state_path = agent_home / "state" / f"{agent_id}.json"
+    if not state_path.exists():
+        return {}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if v is not None}
+
+
+def discover(root: Path) -> list[dict[str, object]]:
+    sessions = tmux_sessions()
+    rows: list[dict[str, object]] = []
+    for env_path in sorted(root.glob("*/.env")):
+        env = parse_env(env_path)
+        agent_id = env.get("REALM_AGENT_ID")
+        if not agent_id:
+            continue
+        home = env_path.parent
+        host = env.get("OPENCODE_HOST", "127.0.0.1")
+        port = env.get("OPENCODE_PORT", "")
+        prompt = Path(env.get("REALM_SYSTEM_PROMPT_FILE", home / "system-prompt.md")).expanduser()
+        state = load_state(home, agent_id)
+        tmux_running = None if sessions is None else agent_id in sessions
+        rows.append(
+            {
+                "agent_id": agent_id,
+                "username": env.get("REALM_USERNAME", agent_id),
+                "home": str(home),
+                "port": port,
+                "port_open": port_open(host, port),
+                "tmux": tmux_running,
+                "state": state.get("state", ""),
+                "task_id": state.get("task_id", ""),
+                "prompt": str(prompt),
+                "prompt_exists": prompt.exists(),
+                "realm_log": env.get("REALM_LOG", f"/tmp/{agent_id}-realm.log"),
+                "opencode_log": env.get("OPENCODE_LOG", f"/tmp/{agent_id}-opencode.log"),
+                "env_keys": sorted(k for k in env if not is_secret(k)),
+            }
+        )
+    return rows
+
+
+def print_table(rows: list[dict[str, object]]) -> None:
+    if not rows:
+        print("No durable agent runtimes found.")
+        return
+    headers = ["agent", "user", "port", "open", "tmux", "state", "home"]
+    widths = {header: len(header) for header in headers}
+    rendered: list[dict[str, str]] = []
+    for row in rows:
+        item = {
+            "agent": str(row["agent_id"]),
+            "user": f"@{row['username']}",
+            "port": str(row["port"] or "-"),
+            "open": "yes" if row["port_open"] else "no",
+            "tmux": "?" if row["tmux"] is None else ("yes" if row["tmux"] else "no"),
+            "state": str(row["state"] or "-"),
+            "home": str(row["home"]),
+        }
+        rendered.append(item)
+        for key, value in item.items():
+            widths[key] = max(widths[key], len(value))
+    print("  ".join(header.ljust(widths[header]) for header in headers))
+    print("  ".join("-" * widths[header] for header in headers))
+    for item in rendered:
+        print("  ".join(item[header].ljust(widths[header]) for header in headers))
+    print()
+    print("Details:")
+    for row in rows:
+        print(f"- {row['agent_id']}:")
+        print(f"  prompt: {row['prompt']} ({'ok' if row['prompt_exists'] else 'missing'})")
+        print(f"  logs: {row['realm_log']}, {row['opencode_log']}")
+        if row["task_id"]:
+            print(f"  task: {row['task_id']}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="List local durable Realm agent runtimes.")
+    parser.add_argument("--root", default=str(Path.home() / ".local" / "share"))
+    parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON.")
+    args = parser.parse_args()
+
+    rows = discover(Path(args.root).expanduser())
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print_table(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
