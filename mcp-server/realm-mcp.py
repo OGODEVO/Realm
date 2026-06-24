@@ -57,6 +57,9 @@ AGENT_NAME = os.getenv("REALM_AGENT_NAME", "medusa-bridge")
 BLOB_DIR = os.getenv("REALM_BLOB_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".blobs"))
 DEFAULT_REQUEST_TIMEOUT = float(os.getenv("REALM_DEFAULT_REQUEST_TIMEOUT_SECONDS", "86400"))
 WORK_TIMEOUT = float(os.getenv("REALM_WORK_TIMEOUT_SECONDS", "86400"))
+# Codex and other MCP clients may enforce their own per-tool-call deadline.
+# Keep blocking task waits below that outer deadline and ask the caller to poll.
+MAX_BLOCKING_WAIT_SECONDS = float(os.getenv("REALM_MCP_MAX_BLOCKING_WAIT_SECONDS", "240"))
 
 _sdk: AgentSDK | None = None
 _current_thread_id: str | None = None
@@ -101,6 +104,15 @@ def _status_for_task_payload(payload: Any) -> str:
     if payload_type:
         return payload_type.removeprefix("task.")
     return "unknown"
+
+
+def _blocking_wait_budget(timeout: float) -> tuple[float, bool]:
+    """Return the in-process wait budget and whether it was client-safety capped."""
+    requested = max(0.1, float(timeout))
+    if MAX_BLOCKING_WAIT_SECONDS <= 0:
+        return requested, False
+    budget = min(requested, MAX_BLOCKING_WAIT_SECONDS)
+    return budget, budget < requested
 
 
 class TaskStore:
@@ -499,7 +511,8 @@ async def await_task(task_id: str, timeout: float = 86400.0) -> str:
     condition = _task_condition
     if store is None or condition is None:
         raise RuntimeError("task store not initialized")
-    deadline = asyncio.get_running_loop().time() + max(0.1, float(timeout))
+    wait_budget, capped = _blocking_wait_budget(timeout)
+    deadline = asyncio.get_running_loop().time() + wait_budget
     while True:
         try:
             registry_row = await sdk.task_status(task_id, timeout=2.0)
@@ -519,6 +532,23 @@ async def await_task(task_id: str, timeout: float = 86400.0) -> str:
             return _json({"ok": local_status == "completed", "source": "local_ledger", **row})
         remaining = deadline - asyncio.get_running_loop().time()
         if remaining <= 0:
+            if capped:
+                return _json(
+                    {
+                        "ok": True,
+                        "terminal": False,
+                        "source": "wait_budget",
+                        "error": "task_still_running",
+                        "message": (
+                            "Task is still running. Poll await_task or task_status "
+                            "with this task_id."
+                        ),
+                        "requested_timeout_seconds": float(timeout),
+                        "waited_seconds": wait_budget,
+                        "max_blocking_wait_seconds": MAX_BLOCKING_WAIT_SECONDS,
+                        **row,
+                    }
+                )
             return _json({"ok": False, "error": "task_timeout", **row})
         async with condition:
             try:
