@@ -47,6 +47,7 @@ from agentnet.task_protocol import (
     TERMINAL_TASK_TYPES,
     decode_task_payload,
     task_id_from_payload,
+    new_task_id,
     task_type,
 )
 from mcp.server.fastmcp import FastMCP
@@ -390,14 +391,57 @@ async def delegate_task(
     if store is None:
         raise RuntimeError("task store not initialized")
     tid = thread_id or _current_thread_id or sdk.new_thread_id()
-    result = await sdk.delegate_task(
-        to,
-        text,
-        title=title,
-        thread_id=tid,
-        parent_message_id=_last_message_id,
-    )
-    task_id = str(result.trace_id or "")
+    task_id = new_task_id()
+    try:
+        result = await sdk.delegate_task(
+            to,
+            text,
+            task_id=task_id,
+            title=title,
+            thread_id=tid,
+            parent_message_id=_last_message_id,
+        )
+    except RuntimeError as exc:
+        if "delivery_ack_timeout" not in str(exc):
+            raise
+        registry_row: dict[str, Any] | None = None
+        try:
+            registry_status = await sdk.task_status(task_id, timeout=2.0)
+            task = registry_status.get("task") if isinstance(registry_status.get("task"), dict) else registry_status
+            if isinstance(task, dict) and str(task.get("task_id") or "") == task_id:
+                registry_row = task
+        except Exception:
+            registry_row = None
+        if registry_row is not None:
+            await store.upsert(
+                task_id,
+                status=str(registry_row.get("status") or "assigned"),
+                type=str(registry_row.get("type") or "task.assign"),
+                target=to,
+                title=title,
+                text=text,
+                payload=registry_row.get("payload"),
+                thread_id=tid,
+                message_id=str(registry_row.get("message_id") or "") or None,
+                created_at=str(registry_row.get("created_at") or registry_row.get("sent_at") or ""),
+                updated_at=str(registry_row.get("updated_at") or registry_row.get("received_at") or ""),
+                delivery_ack="timeout",
+            )
+            if wait:
+                return await await_task(task_id, timeout=timeout)
+            return _json({"ok": True, "source": "registry", "delivery_ack": "timeout", **registry_row})
+        row = await store.upsert(
+            task_id,
+            status="ack_timeout",
+            type="task.assign",
+            target=to,
+            title=title,
+            text=text,
+            thread_id=tid,
+            delivery_ack="timeout",
+            error=str(exc),
+        )
+        return _json({"ok": False, "error": "delivery_ack_timeout", **row})
     _last_message_id = result.message_id
     row = await store.upsert(
         task_id,
