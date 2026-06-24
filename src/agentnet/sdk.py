@@ -1035,6 +1035,23 @@ class AgentSDK:
     async def list_online(self, timeout: float = 2.0) -> list[AgentInfo]:
         return await self._node.list_online_agents(timeout=timeout)
 
+    async def search_profiles(
+        self,
+        *,
+        query: str = "",
+        capability: str | None = None,
+        limit: int = 20,
+        online_only: bool = False,
+        timeout: float = 2.0,
+    ) -> list[dict[str, Any]]:
+        return await self._node.search_profiles(
+            query=query,
+            capability=capability,
+            limit=limit,
+            online_only=online_only,
+            timeout=timeout,
+        )
+
     async def get_profile(
         self,
         target: str | None = None,

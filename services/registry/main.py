@@ -1753,7 +1753,7 @@ class RegistryService:
         if not msg.reply or not self._nc:
             return
 
-        await self._evict_stale()
+        await self._evict_stale_best_effort("registry list")
 
         payload = {
             "generated_at": utc_now_iso(),
@@ -1834,7 +1834,7 @@ class RegistryService:
     async def _on_search(self, msg: Msg) -> None:
         if not msg.reply or not self._nc:
             return
-        await self._evict_stale()
+        await self._evict_stale_best_effort("registry search")
         data = decode_json(msg.data)
         if not isinstance(data, dict):
             await self._nc.publish(msg.reply, encode_json({"error": "search payload must be an object"}))
@@ -1874,7 +1874,7 @@ class RegistryService:
     async def _on_profile(self, msg: Msg) -> None:
         if not msg.reply or not self._nc:
             return
-        await self._evict_stale()
+        await self._evict_stale_best_effort("registry profile")
         data = decode_json(msg.data)
         if not isinstance(data, dict):
             await self._nc.publish(msg.reply, encode_json({"error": "profile payload must be an object"}))
@@ -2216,6 +2216,12 @@ class RegistryService:
                     f"Agent disconnected: {self._presentation_agent_label(departing)}",
                     enabled=self._agentnet_logs_enabled,
                 )
+
+    async def _evict_stale_best_effort(self, context: str) -> None:
+        try:
+            await asyncio.wait_for(self._evict_stale(), timeout=1.0)
+        except Exception:
+            self.logger.exception("Failed evicting stale sessions before %s", context)
 
     async def _resolve_or_create_account(
         self,
