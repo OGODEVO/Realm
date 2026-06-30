@@ -450,6 +450,7 @@ def is_recoverable_session_error(exc: Exception) -> bool:
     return (
         message.startswith("OpenCode exited ")
         or message == "OpenCode completed without returning a final text response"
+        or "Session not found" in message
     )
 
 
@@ -494,12 +495,13 @@ async def ask_opencode_resilient(
             thread_id=thread_id,
         )
     except Exception as exc:
-        if not existing_session or not map_key or not is_recoverable_session_error(exc):
+        if not map_key or not is_recoverable_session_error(exc):
             raise
 
     # Keep the public Realm thread, but detach its broken OpenCode conversation.
-    session_map.pop(map_key, None)
-    save_session_map(session_map)
+    if existing_session:
+        session_map.pop(map_key, None)
+        save_session_map(session_map)
     if sdk and to_agent and thread_id:
         try:
             await sdk.send_text(
