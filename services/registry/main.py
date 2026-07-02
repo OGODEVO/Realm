@@ -1226,6 +1226,19 @@ class PostgresSessionStore:
             disconnected_at,
         )
 
+    async def mark_all_online_offline(self, disconnected_at: datetime) -> int:
+        if self._pool is None:
+            return 0
+        result = await self._pool.execute(
+            """
+            UPDATE agent_sessions
+            SET disconnected_at = $1, status = 'offline'
+            WHERE status = 'online'
+            """,
+            disconnected_at,
+        )
+        return int(result.split()[-1]) if result else 0
+
     async def prune_offline(self, now: datetime) -> None:
         if self._pool is None:
             return
@@ -1358,6 +1371,9 @@ class RegistryService:
     async def start(self) -> None:
         if self._store is not None:
             await self._store.start()
+            cleaned = await self._store.mark_all_online_offline(disconnected_at=_utc_now())
+            if cleaned:
+                self.logger.info("Startup: marked %d stale online sessions offline", cleaned)
             if self.db_write_batch_enabled:
                 self._db_write_queue = asyncio.Queue(maxsize=self.db_write_queue_max)
                 self._db_write_worker_task = asyncio.create_task(
@@ -2996,7 +3012,6 @@ class RegistryService:
             self.thread_retention_days,
         )
 
-    @staticmethod
     def _presentation_agent_label(self, agent: AgentInfo) -> str:
         return format_actor(
             name=agent.name,
