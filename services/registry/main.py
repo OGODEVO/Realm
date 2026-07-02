@@ -994,6 +994,111 @@ class PostgresSessionStore:
         snapshots.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
         return snapshots[:safe_limit]
 
+    async def sweep_stale_assigned_tasks(self, *, older_than: datetime, limit: int) -> int:
+        """Auto-fail assigned tasks whose assignee is no longer online.
+
+        Task state is derived from task.* message events, so the registry resolves
+        stale assignments by inserting a synthetic task.failed event. This keeps
+        task_status/list_tasks truthful without adding a separate task table.
+        """
+        if self._pool is None:
+            return 0
+        safe_limit = max(1, min(int(limit), 500))
+        rows = await self._pool.fetch(
+            """
+            SELECT DISTINCT ON (m.payload->>'task_id')
+                m.payload->>'task_id' AS task_id,
+                m.message_id AS assign_message_id,
+                m.thread_id,
+                m.from_account_id AS coordinator_account_id,
+                m.to_account_id AS assignee_account_id,
+                m.to_agent,
+                m.trace_id,
+                m.sent_at AS assigned_at
+            FROM agent_messages AS m
+            WHERE m.payload->>'type' = $1
+              AND m.sent_at < $2
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM agent_messages AS terminal
+                  WHERE terminal.payload->>'task_id' = m.payload->>'task_id'
+                    AND terminal.payload->>'type' = ANY($3::text[])
+              )
+              AND (
+                  m.to_account_id IS NULL
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM agent_sessions AS s
+                      WHERE s.account_id = m.to_account_id
+                        AND s.status = 'online'
+                  )
+              )
+            ORDER BY m.payload->>'task_id', m.sent_at ASC, m.message_id ASC
+            LIMIT $4
+            """,
+            TASK_ASSIGN,
+            older_than,
+            list(TERMINAL_TASK_TYPES),
+            safe_limit,
+        )
+        if not rows:
+            return 0
+
+        now = _utc_now()
+        failed = 0
+        async with self._pool.acquire() as conn, conn.transaction():
+            for row in rows:
+                task_id = str(row["task_id"] or "").strip()
+                if not task_id:
+                    continue
+                # Re-check under the transaction to avoid racing a legitimate terminal event.
+                has_terminal = await conn.fetchval(
+                    """
+                    SELECT TRUE
+                    FROM agent_messages
+                    WHERE payload->>'task_id' = $1
+                      AND payload->>'type' = ANY($2::text[])
+                    LIMIT 1
+                    """,
+                    task_id,
+                    list(TERMINAL_TASK_TYPES),
+                )
+                if has_terminal:
+                    continue
+                assigned_at = row["assigned_at"]
+                assigned_at_text = _iso_utc(assigned_at) if isinstance(assigned_at, datetime) else str(assigned_at or "")
+                failed_message = AgentMessage(
+                    message_id=f"registry_stale_{task_id}",
+                    from_agent="registry",
+                    to_agent=str(row["coordinator_account_id"] or "registry"),
+                    from_account_id=str(row["assignee_account_id"] or "") or None,
+                    to_account_id=str(row["coordinator_account_id"] or "") or None,
+                    parent_message_id=str(row["assign_message_id"] or "") or None,
+                    thread_id=str(row["thread_id"] or "") or None,
+                    trace_id=str(row["trace_id"] or task_id),
+                    kind="reply",
+                    sent_at=_iso_utc(now),
+                    payload={
+                        "type": TASK_FAILED,
+                        "task_id": task_id,
+                        "status": "failed",
+                        "text": (
+                            "Task auto-failed by registry: assignee is offline and no terminal "
+                            f"event was recorded since assignment at {assigned_at_text}."
+                        ),
+                        "finished_at": _iso_utc(now),
+                        "metadata": {
+                            "reason": "stale_assigned_task",
+                            "assigned_at": assigned_at_text,
+                            "assigned_message_id": str(row["assign_message_id"] or ""),
+                            "assignee_account_id": str(row["assignee_account_id"] or "") or None,
+                        },
+                    },
+                )
+                if await self._persist_message_with_conn(conn, failed_message, received_at=now):
+                    failed += 1
+        return failed
+
     async def _persist_message_with_conn(self, conn: Any, message: AgentMessage, received_at: datetime) -> bool:
         message_id = str(message.message_id or "").strip()
         if not message_id:
@@ -1226,6 +1331,19 @@ class PostgresSessionStore:
             disconnected_at,
         )
 
+    async def mark_all_online_offline(self, disconnected_at: datetime) -> int:
+        if self._pool is None:
+            return 0
+        result = await self._pool.execute(
+            """
+            UPDATE agent_sessions
+            SET disconnected_at = $1, status = 'offline'
+            WHERE status = 'online'
+            """,
+            disconnected_at,
+        )
+        return int(result.split()[-1]) if result else 0
+
     async def prune_offline(self, now: datetime) -> None:
         if self._pool is None:
             return
@@ -1302,6 +1420,8 @@ class RegistryService:
         db_write_batch_size: int = 64,
         db_write_flush_ms: float = 40.0,
         db_write_queue_max: int = 10000,
+        stale_task_timeout_seconds: float = 3600.0,
+        stale_task_sweep_limit: int = 100,
     ) -> None:
         self.nats_url = nats_url
         self.ttl_seconds = ttl_seconds
@@ -1323,6 +1443,8 @@ class RegistryService:
         self.db_write_batch_size = max(1, int(db_write_batch_size))
         self.db_write_flush_seconds = max(0.001, float(db_write_flush_ms) / 1000.0)
         self.db_write_queue_max = max(100, int(db_write_queue_max))
+        self.stale_task_timeout_seconds = max(0.0, float(stale_task_timeout_seconds))
+        self.stale_task_sweep_limit = max(1, int(stale_task_sweep_limit))
 
         self._nc: NATS | None = None
         self._gc_task: asyncio.Task[None] | None = None
@@ -1358,6 +1480,9 @@ class RegistryService:
     async def start(self) -> None:
         if self._store is not None:
             await self._store.start()
+            cleaned = await self._store.mark_all_online_offline(disconnected_at=_utc_now())
+            if cleaned:
+                self.logger.info("Startup: marked %d stale online sessions offline", cleaned)
             if self.db_write_batch_enabled:
                 self._db_write_queue = asyncio.Queue(maxsize=self.db_write_queue_max)
                 self._db_write_worker_task = asyncio.create_task(
@@ -2196,7 +2321,27 @@ class RegistryService:
             await asyncio.sleep(self.gc_interval_seconds)
             self._cleanup_dev_auth_state()
             await self._evict_stale()
+            await self._sweep_stale_tasks()
             await self._prune_persisted_sessions()
+
+    async def _sweep_stale_tasks(self) -> None:
+        if self._store is None or self.stale_task_timeout_seconds <= 0:
+            return
+        older_than = _utc_now() - timedelta(seconds=self.stale_task_timeout_seconds)
+        try:
+            failed = await self._store.sweep_stale_assigned_tasks(
+                older_than=older_than,
+                limit=self.stale_task_sweep_limit,
+            )
+        except Exception:  # noqa: BLE001
+            self.logger.exception("Failed sweeping stale assigned tasks")
+            return
+        if failed:
+            self.logger.warning("Auto-failed %d stale assigned tasks", failed)
+            emit_agentnet_log(
+                f"Registry auto-failed {failed} stale assigned task(s)",
+                enabled=self._agentnet_logs_enabled,
+            )
 
     async def _evict_stale(self) -> None:
         cutoff = time.monotonic() - self.ttl_seconds
@@ -2996,7 +3141,6 @@ class RegistryService:
             self.thread_retention_days,
         )
 
-    @staticmethod
     def _presentation_agent_label(self, agent: AgentInfo) -> str:
         return format_actor(
             name=agent.name,
@@ -3074,6 +3218,8 @@ async def amain() -> None:
     db_write_batch_size = int(os.getenv("DB_WRITE_BATCH_SIZE", "64"))
     db_write_flush_ms = float(os.getenv("DB_WRITE_FLUSH_MS", "40"))
     db_write_queue_max = int(os.getenv("DB_WRITE_QUEUE_MAX", "10000"))
+    stale_task_timeout_seconds = float(os.getenv("STALE_TASK_TIMEOUT_SECONDS", "3600"))
+    stale_task_sweep_limit = int(os.getenv("STALE_TASK_SWEEP_LIMIT", "100"))
 
     service = RegistryService(
         nats_url=nats_url,
@@ -3097,6 +3243,8 @@ async def amain() -> None:
         db_write_batch_size=db_write_batch_size,
         db_write_flush_ms=db_write_flush_ms,
         db_write_queue_max=db_write_queue_max,
+        stale_task_timeout_seconds=stale_task_timeout_seconds,
+        stale_task_sweep_limit=stale_task_sweep_limit,
     )
     await service.start()
 

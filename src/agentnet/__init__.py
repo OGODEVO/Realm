@@ -1,6 +1,26 @@
 """AgentNet public API."""
 
 from agentnet.blob import BlobRef, LocalBlobStore, is_blob_ref, parse_blob_ref
+from agentnet.exceptions import (
+    AgentSDKError,
+    AgentRequestError,
+    AgentBusyError,
+    AgentRateLimitedError,
+    AgentTimeoutError,
+    AgentServiceDegradedError,
+    AgentDuplicateError,
+    AgentExpiredError,
+    AgentHandlerError,
+    ConnectionError,
+    DeliveryAckTimeout,
+    DeliveryAckUnusable,
+    DeliveryRejected,
+    RegistryError,
+    RegistryProtocolError,
+    RegistryRemoteError,
+    RegistryTimeout,
+    TransportError,
+)
 from agentnet.node import AgentNode
 from agentnet.events import (
     CompactionRequiredEvent,
@@ -28,16 +48,7 @@ from agentnet.registry import (
 )
 from agentnet.schema import AgentInfo, AgentMessage, DeliveryReceipt
 from agentnet.sdk import (
-    AgentBusyError,
-    AgentDuplicateError,
-    AgentExpiredError,
-    AgentHandlerError,
     AgentSDK,
-    AgentRateLimitedError,
-    AgentRequestError,
-    AgentSDKError,
-    AgentServiceDegradedError,
-    AgentTimeoutError,
     AgentWrapper,
     SDKResult,
     ThreadSession,
@@ -68,6 +79,15 @@ __all__ = [
     "AgentDuplicateError",
     "AgentExpiredError",
     "AgentHandlerError",
+    "TransportError",
+    "ConnectionError",
+    "DeliveryAckTimeout",
+    "DeliveryRejected",
+    "DeliveryAckUnusable",
+    "RegistryError",
+    "RegistryTimeout",
+    "RegistryProtocolError",
+    "RegistryRemoteError",
     "list_online_agents",
     "search_profiles",
     "get_profile",

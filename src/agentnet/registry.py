@@ -8,6 +8,12 @@ from nats.aio.client import Client as NATS
 from nats.errors import NoServersError, TimeoutError
 
 from agentnet.config import DEFAULT_NATS_URL
+from agentnet.exceptions import (
+    ConnectionError,
+    registry_protocol_error,
+    registry_remote_error,
+    registry_timeout,
+)
 from agentnet.schema import AgentInfo
 from agentnet.subjects import (
     REGISTRY_METRICS_SUBJECT,
@@ -36,7 +42,7 @@ async def list_online_agents(nats_url: str = DEFAULT_NATS_URL, timeout: float = 
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await list_online_agents_with_client(nc, timeout=timeout)
     finally:
@@ -47,7 +53,7 @@ async def list_online_agents_with_client(nc: NATS, timeout: float = 2.0) -> list
     try:
         response = await nc.request(REGISTRY_LIST_SUBJECT, encode_json({}), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.list") from exc
+        raise registry_timeout("registry.list") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
@@ -76,7 +82,7 @@ async def resolve_account_by_username(nats_url: str, username: str, timeout: flo
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await resolve_account_by_username_with_client(nc, username=username, timeout=timeout)
     finally:
@@ -94,18 +100,18 @@ async def resolve_account_by_username_with_client(nc: NATS, username: str, timeo
             timeout=timeout,
         )
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.resolve_account") from exc
+        raise registry_timeout("registry.resolve_account") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.resolve_account response must be an object")
+        raise registry_protocol_error("registry.resolve_account", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "resolve_account_failed"))
+        raise registry_remote_error("registry.resolve_account", data.get("error") or "resolve_account_failed")
 
     account_id = str(data.get("account_id") or "")
     resolved_username = str(data.get("username") or "")
     if not account_id:
-        raise RuntimeError("registry.resolve_account missing account_id")
+        raise registry_protocol_error("registry.resolve_account", "missing account_id")
     if not resolved_username:
         resolved_username = target
     return account_id, resolved_username
@@ -125,7 +131,7 @@ async def resolve_dev_public_key_by_account(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await resolve_dev_public_key_by_account_with_client(nc, account_id=account_id, timeout=timeout)
     finally:
@@ -147,16 +153,16 @@ async def resolve_dev_public_key_by_account_with_client(
             timeout=timeout,
         )
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.resolve_key") from exc
+        raise registry_timeout("registry.resolve_key") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.resolve_key response must be an object")
+        raise registry_protocol_error("registry.resolve_key", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "resolve_key_failed"))
+        raise registry_remote_error("registry.resolve_key", data.get("error") or "resolve_key_failed")
     public_key = str(data.get("public_key") or "")
     if not public_key:
-        raise RuntimeError("registry.resolve_key missing public_key")
+        raise registry_protocol_error("registry.resolve_key", "missing public_key")
     return public_key
 
 
@@ -178,7 +184,7 @@ async def search_profiles(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await search_profiles_with_client(
             nc,
@@ -211,13 +217,13 @@ async def search_profiles_with_client(
     try:
         response = await nc.request(REGISTRY_SEARCH_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.search") from exc
+        raise registry_timeout("registry.search") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.search response must be an object")
+        raise registry_protocol_error("registry.search", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "search_failed"))
+        raise registry_remote_error("registry.search", data.get("error") or "search_failed")
     results = data.get("results")
     if not isinstance(results, list):
         return []
@@ -240,7 +246,7 @@ async def get_profile(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await get_profile_with_client(nc, account_id=account_id, username=username, timeout=timeout)
     finally:
@@ -264,16 +270,16 @@ async def get_profile_with_client(
     try:
         response = await nc.request(REGISTRY_PROFILE_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.profile") from exc
+        raise registry_timeout("registry.profile") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.profile response must be an object")
+        raise registry_protocol_error("registry.profile", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "profile_failed"))
+        raise registry_remote_error("registry.profile", data.get("error") or "profile_failed")
     profile = data.get("profile")
     if not isinstance(profile, dict):
-        raise RuntimeError("registry.profile missing profile")
+        raise registry_protocol_error("registry.profile", "missing profile")
     return profile
 
 
@@ -294,7 +300,7 @@ async def get_thread_status(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await get_thread_status_with_client(
             nc,
@@ -325,13 +331,13 @@ async def get_thread_status_with_client(
     try:
         response = await nc.request(REGISTRY_THREAD_STATUS_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.thread_status") from exc
+        raise registry_timeout("registry.thread_status") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.thread_status response must be an object")
+        raise registry_protocol_error("registry.thread_status", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "thread_status_failed"))
+        raise registry_remote_error("registry.thread_status", data.get("error") or "thread_status_failed")
     return data
 
 
@@ -355,7 +361,7 @@ async def list_threads(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await list_threads_with_client(
             nc,
@@ -396,13 +402,13 @@ async def list_threads_with_client(
     try:
         response = await nc.request(REGISTRY_THREAD_LIST_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.thread_list") from exc
+        raise registry_timeout("registry.thread_list") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.thread_list response must be an object")
+        raise registry_protocol_error("registry.thread_list", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "thread_list_failed"))
+        raise registry_remote_error("registry.thread_list", data.get("error") or "thread_list_failed")
     results = data.get("results")
     if not isinstance(results, list):
         return []
@@ -426,7 +432,7 @@ async def get_thread_messages(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await get_thread_messages_with_client(
             nc,
@@ -460,13 +466,13 @@ async def get_thread_messages_with_client(
     try:
         response = await nc.request(REGISTRY_THREAD_MESSAGES_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.thread_messages") from exc
+        raise registry_timeout("registry.thread_messages") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.thread_messages response must be an object")
+        raise registry_protocol_error("registry.thread_messages", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "thread_messages_failed"))
+        raise registry_remote_error("registry.thread_messages", data.get("error") or "thread_messages_failed")
     return data
 
 
@@ -492,7 +498,7 @@ async def search_messages(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await search_messages_with_client(
             nc,
@@ -544,13 +550,13 @@ async def search_messages_with_client(
     try:
         response = await nc.request(REGISTRY_MESSAGE_SEARCH_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.message_search") from exc
+        raise registry_timeout("registry.message_search") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.message_search response must be an object")
+        raise registry_protocol_error("registry.message_search", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "message_search_failed"))
+        raise registry_remote_error("registry.message_search", data.get("error") or "message_search_failed")
     return data
 
 
@@ -569,7 +575,7 @@ async def get_task_status(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await get_task_status_with_client(nc, task_id=task_id, timeout=timeout)
     finally:
@@ -592,13 +598,13 @@ async def get_task_status_with_client(
             timeout=timeout,
         )
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.task_status") from exc
+        raise registry_timeout("registry.task_status") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.task_status response must be an object")
+        raise registry_protocol_error("registry.task_status", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "task_status_failed"))
+        raise registry_remote_error("registry.task_status", data.get("error") or "task_status_failed")
     return data
 
 
@@ -620,7 +626,7 @@ async def list_tasks(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await list_tasks_with_client(
             nc,
@@ -653,13 +659,13 @@ async def list_tasks_with_client(
     try:
         response = await nc.request(REGISTRY_TASK_LIST_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.task_list") from exc
+        raise registry_timeout("registry.task_list") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.task_list response must be an object")
+        raise registry_protocol_error("registry.task_list", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "task_list_failed"))
+        raise registry_remote_error("registry.task_list", data.get("error") or "task_list_failed")
     tasks = data.get("tasks")
     if not isinstance(tasks, list):
         return []
@@ -680,7 +686,7 @@ async def get_registry_metrics(
             connect_timeout=timeout,
         )
     except (NoServersError, OSError) as exc:
-        raise RuntimeError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
     try:
         return await get_registry_metrics_with_client(nc, timeout=timeout)
     finally:
@@ -695,11 +701,11 @@ async def get_registry_metrics_with_client(
     try:
         response = await nc.request(REGISTRY_METRICS_SUBJECT, encode_json({}), timeout=timeout)
     except TimeoutError as exc:
-        raise RuntimeError("Registry did not respond to registry.metrics") from exc
+        raise registry_timeout("registry.metrics") from exc
 
     data: Any = decode_json(response.data)
     if not isinstance(data, dict):
-        raise RuntimeError("registry.metrics response must be an object")
+        raise registry_protocol_error("registry.metrics", "response must be an object")
     if "error" in data:
-        raise RuntimeError(str(data.get("error") or "metrics_failed"))
+        raise registry_remote_error("registry.metrics", data.get("error") or "metrics_failed")
     return data

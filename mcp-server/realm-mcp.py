@@ -38,6 +38,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
+from agentnet.exceptions import DeliveryAckTimeout
 from agentnet.sdk import AgentSDK
 from agentnet.schema import AgentMessage
 from agentnet.task_protocol import (
@@ -413,9 +414,7 @@ async def delegate_task(
             thread_id=tid,
             parent_message_id=_last_message_id,
         )
-    except RuntimeError as exc:
-        if "delivery_ack_timeout" not in str(exc):
-            raise
+    except DeliveryAckTimeout as exc:
         registry_row: dict[str, Any] | None = None
         try:
             registry_status = await sdk.task_status(task_id, timeout=2.0)

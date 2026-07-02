@@ -71,6 +71,29 @@ agentnet tasks --limit 20
 The MCP bridge also keeps a local cache, but the registry is the shared source
 of truth once it has observed the task messages.
 
+### Agent Launcher and Collaboration MCPs
+
+Two additional MCP servers can be registered alongside the base Realm bridge:
+
+- `realm_agent_launcher`: launch, restart, stop, list, and inspect RAM/process stats for local OpenCode-backed Realm agents.
+- `realm_collaborator`: coordinate multi-agent workflows with `collaborate_chain` and `collaborate_council`.
+
+Runtime files:
+
+```bash
+~/.local/share/realm/mcp-server/realm-agent-launcher.py
+~/.local/share/realm/mcp-server/realm-collaborator.py
+~/.local/bin/realm-agent-launcher-stdio
+~/.local/bin/realm-collaborator-stdio
+~/.local/share/realm-agent-launcher/agents/<agent_id>/
+```
+
+OpenCode-backed agents should process Realm `task.assign` messages as isolated
+tasks, not as ordinary chat continuation. The example wrapper uses a
+task-specific OpenCode session key and sends task results without requiring a
+delivery ack, because the registry can persist the result even when the
+coordinator-side ack is late.
+
 Stdio (default) or SSE:
 
 ```bash

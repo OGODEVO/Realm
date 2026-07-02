@@ -16,6 +16,11 @@ from nats.aio.client import Client as NATS
 from nats.aio.msg import Msg
 
 from agentnet.config import DEFAULT_NATS_URL
+from agentnet.exceptions import (
+    DeliveryAckTimeout,
+    DeliveryAckUnusable,
+    DeliveryRejected,
+)
 from agentnet.dev_auth import (
     DEV_AUTH_SCHEME,
     build_message_claims,
@@ -911,8 +916,9 @@ class AgentNode:
                 except asyncio.TimeoutError:
                     self._receipt_timeout_count += 1
                     if attempt >= max_attempts:
-                        raise RuntimeError(
-                            f"delivery_ack_timeout message_id={envelope.message_id} attempts={max_attempts}"
+                        raise DeliveryAckTimeout(
+                            f"delivery_ack_timeout message_id={envelope.message_id} attempts={max_attempts}",
+                            message_id=envelope.message_id,
                         ) from None
                     await asyncio.sleep(min(0.1 * attempt, 0.5))
                     continue
@@ -925,10 +931,14 @@ class AgentNode:
                         return
                     code = receipt.code or "rejected"
                     detail = receipt.detail or "delivery rejected by recipient"
-                    raise RuntimeError(f"delivery_rejected {code}: {detail}")
+                    raise DeliveryRejected(
+                        f"delivery_rejected {code}: {detail}",
+                        message_id=envelope.message_id,
+                    )
                 if attempt >= max_attempts:
-                    raise RuntimeError(
-                        f"delivery_ack_unusable status={status or 'unknown'} message_id={envelope.message_id}"
+                    raise DeliveryAckUnusable(
+                        f"delivery_ack_unusable status={status or 'unknown'} message_id={envelope.message_id}",
+                        message_id=envelope.message_id,
                     )
         finally:
             self._pending_receipts.pop(envelope.message_id, None)
