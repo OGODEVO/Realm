@@ -9,6 +9,27 @@ from typing import Any
 
 from agentnet.blob import BlobRef, LocalBlobStore
 from agentnet.config import DEFAULT_NATS_URL
+from agentnet.exceptions import (
+    ERROR_CLASS_BY_CODE as _ERROR_CLASS_BY_CODE,
+    AgentSDKError,
+    AgentRequestError,
+    AgentBusyError,
+    AgentRateLimitedError,
+    AgentTimeoutError,
+    AgentServiceDegradedError,
+    AgentDuplicateError,
+    AgentExpiredError,
+    AgentHandlerError,
+    ConnectionError,
+    DeliveryAckTimeout,
+    DeliveryAckUnusable,
+    DeliveryRejected,
+    RegistryError,
+    RegistryProtocolError,
+    RegistryRemoteError,
+    RegistryTimeout,
+    TransportError,
+)
 from agentnet.node import AgentNode
 from agentnet.registry import get_registry_metrics, get_task_status, get_thread_status, list_tasks
 from agentnet.schema import AgentInfo, AgentMessage
@@ -16,70 +37,6 @@ from agentnet.task_protocol import build_task_assign, new_task_id
 from agentnet.utils import utc_now_iso
 
 ReceiveHandler = Callable[[AgentMessage], Awaitable[None]]
-
-
-class AgentSDKError(Exception):
-    """Base error for SDK operations."""
-
-
-class AgentRequestError(AgentSDKError):
-    """Request failed with a remote error response."""
-
-    def __init__(
-        self,
-        *,
-        code: str,
-        detail: str,
-        trace_id: str | None = None,
-        request_message_id: str | None = None,
-    ) -> None:
-        message = f"{code}: {detail}" if detail else code
-        super().__init__(message)
-        self.code = code
-        self.detail = detail
-        self.trace_id = trace_id
-        self.request_message_id = request_message_id
-
-
-class AgentBusyError(AgentRequestError):
-    pass
-
-
-class AgentRateLimitedError(AgentRequestError):
-    pass
-
-
-class AgentTimeoutError(AgentRequestError):
-    pass
-
-
-class AgentServiceDegradedError(AgentRequestError):
-    pass
-
-
-class AgentDuplicateError(AgentRequestError):
-    pass
-
-
-class AgentExpiredError(AgentRequestError):
-    pass
-
-
-class AgentHandlerError(AgentRequestError):
-    pass
-
-
-_ERROR_CLASS_BY_CODE: dict[str, type[AgentRequestError]] = {
-    "busy": AgentBusyError,
-    "shutting_down": AgentBusyError,
-    "rate_limited": AgentRateLimitedError,
-    "timeout": AgentTimeoutError,
-    "service_degraded": AgentServiceDegradedError,
-    "duplicate": AgentDuplicateError,
-    "expired": AgentExpiredError,
-    "missing_ttl": AgentExpiredError,
-    "handler_error": AgentHandlerError,
-}
 
 
 @dataclass(slots=True)

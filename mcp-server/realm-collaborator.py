@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from agentnet.sdk import AgentSDK
+from agentnet.exceptions import DeliveryAckTimeout, TransportError
 from agentnet.task_protocol import TERMINAL_TASK_TYPES, new_task_id
 from mcp.server.fastmcp import FastMCP
 
@@ -108,16 +109,7 @@ async def _delegate(
             "thread_id": thread_id,
             "delivery_ack": "ok",
         }
-    except RuntimeError as exc:
-        if "delivery_ack_timeout" not in str(exc):
-            return {
-                "ok": False,
-                "agent": to,
-                "task_id": task_id,
-                "thread_id": thread_id,
-                "delivery_ack": "failed",
-                "error": str(exc),
-            }
+    except DeliveryAckTimeout:
         return {
             "ok": True,
             "agent": to,
@@ -125,6 +117,16 @@ async def _delegate(
             "thread_id": thread_id,
             "delivery_ack": "timeout",
             "warning": "delivery ack timed out; task may still be running in registry",
+        }
+    except TransportError as exc:
+        return {
+            "ok": False,
+            "agent": to,
+            "task_id": task_id,
+            "thread_id": thread_id,
+            "delivery_ack": "failed",
+            "error": str(exc),
+            "error_instance_id": getattr(exc, "error_instance_id", None),
         }
 
 

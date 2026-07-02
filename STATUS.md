@@ -1,6 +1,6 @@
 # Stackwise — Agent Mission Tracker
 
-**Last update:** 2026-06-13T19:01:10Z
+**Last update:** 2026-07-01T00:35:00Z
 
 **Mission:** Turn stack-wise (iOS supplement tracking app) into a full business.
 **Repo:** https://github.com/OGODEVO/stack-wise
@@ -76,3 +76,32 @@ On the next heartbeat, eng-m2 should:
 - eng-m2 ACKed task `stackwise-backend-hardening-001` at 2026-06-13T18:59:15Z.
 - m4-dl is online and emitted malformed ACK/WORKING messages for the ACK-only check itself, but actual backend audit pickup is not confirmed; do not block eng-m2.
 - eng-m2 state updates are now written by heartbeat and the worker via `/Users/klyexy/.local/bin/agent-state-update`.
+
+---
+
+## Realm MCP Orchestration Update — 2026-07-01
+
+**Status:** Network is reachable again over `nats://agentnet_secret_token@100.84.141.84:4222`. Registry store and DB queue are enabled. The current MCP surface includes the base Realm bridge, the agent launcher, and the collaborator/council tools.
+
+### Added MCP Tools
+- `realm_agent_launcher`: launches, lists, restarts, stops, and reports RAM/process stats for local OpenCode-backed Realm agents.
+- `realm_collaborator`: coordinates `collaborate_chain` sequential handoffs and `collaborate_council` parallel council workflows.
+
+### Runtime Paths
+- Launcher MCP: `/Users/klyexy/.local/share/realm/mcp-server/realm-agent-launcher.py`
+- Collaborator MCP: `/Users/klyexy/.local/share/realm/mcp-server/realm-collaborator.py`
+- Launcher state: `/Users/klyexy/.local/share/realm-agent-launcher/agents/<agent_id>/`
+- Codex MCP config: `/Users/klyexy/.codex/config.toml`
+- OpenCode MCP config: `/Users/klyexy/.config/opencode/opencode.json`
+- Cursor MCP config: `/Users/klyexy/.cursor/mcp.json`
+
+### Task Wrapper Fix
+- Patched `examples/opencode_realm_agent.py` so Realm `task.assign` runs use task-specific OpenCode session keys instead of reusing broad thread chat sessions.
+- Task prompts now include structured task context: `task_id`, `title`, `thread_id`, and metadata.
+- Task result delivery now uses `require_delivery_ack=False` to avoid false handler failures when the registry stores a result but the coordinator ack arrives late.
+
+### Verification
+- `tests/test_opencode_realm_agent.py`: `10 passed`.
+- Restarted local agents `k-builder` and `k-reviewer`.
+- Reran `realm_collaborator.collaborate_council` with `k-builder`, `k-reviewer`, and judge `realm-worker-a`.
+- Result: both local agents completed the smoke task correctly, and the judge synthesized successfully.

@@ -473,6 +473,11 @@ def clean_task_answer(answer: str) -> str:
     )
 
 
+def task_session_key(thread_id: str | None, task_id: str) -> str:
+    """Keep task runs isolated from ad-hoc chat sessions on the same thread."""
+    return f"{thread_id or 'no-thread'}::task::{task_id}"
+
+
 async def ask_opencode_resilient(
     prompt: str,
     *,
@@ -610,6 +615,14 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
         return
 
     task_id = task_id or msg.trace_id or ""
+    task_session = task_session_key(msg.thread_id, task_id) if is_task_assignment else msg.thread_id
+    task_title = ""
+    task_metadata: dict[str, Any] = {}
+    if isinstance(msg.payload, dict):
+        task_title = str(msg.payload.get("title") or "")
+        raw_metadata = msg.payload.get("metadata")
+        if isinstance(raw_metadata, dict):
+            task_metadata = raw_metadata
 
     # -- pre-check cancellation ----------------------------------------------
     if read_agent_state().get("state") == "cancelling":
@@ -646,9 +659,18 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
 
     # -- execute -------------------------------------------------------------
     try:
+        task_context = ""
+        if is_task_assignment:
+            task_context = (
+                "\n\nRealm task context:\n"
+                f"- task_id: {task_id}\n"
+                f"- title: {task_title or '(none)'}\n"
+                f"- thread_id: {msg.thread_id or '(none)'}\n"
+                f"- metadata: {json.dumps(task_metadata, sort_keys=True)}\n"
+            )
         answer = await ask_opencode_until_complete(
-            f"{SYSTEM_PROMPT}\n\n{EXECUTION_CONTRACT}\n\nRequest:\n{text}",
-            realm_thread_id=msg.thread_id,
+            f"{SYSTEM_PROMPT}\n\n{EXECUTION_CONTRACT}{task_context}\n\nRequest:\n{text}",
+            realm_thread_id=task_session,
             session_map=session_map,
             sdk=sdk, to_agent=to, thread_id=msg.thread_id)
         await update_agent_state("done", task_id=task_id,
@@ -682,7 +704,13 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
         await sdk.node.reply(msg, payload, thread_id=msg.thread_id)
     elif to:
         if is_task_assignment:
-            await sdk.send_json(to, payload, thread_id=msg.thread_id)
+            await sdk.send_json(
+                to,
+                payload,
+                thread_id=msg.thread_id,
+                idempotency_key=f"{task_id}:result",
+                require_delivery_ack=False,
+            )
         else:
             await sdk.send_text(to, json.dumps(payload), thread_id=msg.thread_id)
 
