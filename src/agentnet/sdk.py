@@ -31,9 +31,15 @@ from agentnet.exceptions import (
     TransportError,
 )
 from agentnet.node import AgentNode
-from agentnet.registry import get_registry_metrics, get_task_status, get_thread_status, list_tasks
+from agentnet.registry import (
+    get_agent_status,
+    get_registry_metrics,
+    get_task_status,
+    get_thread_status,
+    list_tasks,
+)
 from agentnet.schema import AgentInfo, AgentMessage
-from agentnet.task_protocol import build_task_assign, new_task_id
+from agentnet.task_protocol import build_task_assign, build_task_progress, new_task_id
 from agentnet.utils import utc_now_iso
 
 ReceiveHandler = Callable[[AgentMessage], Awaitable[None]]
@@ -1116,6 +1122,7 @@ class AgentSDK:
         assignee_account_id: str | None = None,
         coordinator_account_id: str | None = None,
         status: str | None = None,
+        parent_task_id: str | None = None,
         limit: int = 20,
         timeout: float = 2.0,
     ) -> list[dict[str, Any]]:
@@ -1124,9 +1131,52 @@ class AgentSDK:
             assignee_account_id=assignee_account_id,
             coordinator_account_id=coordinator_account_id,
             status=status,
+            parent_task_id=parent_task_id,
             limit=limit,
             timeout=timeout,
         )
+
+    async def agent_status(self, target: str, *, limit: int = 10, timeout: float = 2.0) -> dict[str, Any]:
+        """What is this agent doing? Presence + active tasks + latest progress summary."""
+        return await get_agent_status(self._node.nats_url, target, limit=limit, timeout=timeout)
+
+    async def report_progress(
+        self,
+        to: str,
+        task_id: str,
+        text: str,
+        *,
+        thread_id: str | None = None,
+        parent_message_id: str | None = None,
+        percent: float | int | None = None,
+        phase: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        require_delivery_ack: bool = False,
+        retry_attempts: int | None = None,
+        receipt_timeout: float | None = None,
+    ) -> SDKResult:
+        """Publish task.progress so coordinators can see live work state."""
+        payload = build_task_progress(
+            task_id=task_id,
+            text=text,
+            percent=percent,
+            phase=phase,
+            metadata=metadata,
+        )
+        result = await self.send_json(
+            to,
+            payload,
+            thread_id=thread_id,
+            parent_message_id=parent_message_id,
+            idempotency_key=None,
+            require_delivery_ack=require_delivery_ack,
+            retry_attempts=retry_attempts,
+            receipt_timeout=receipt_timeout,
+        )
+        result.data = payload
+        result.text = text
+        result.trace_id = str(task_id)
+        return result
 
     async def send_text(
         self,
@@ -1243,20 +1293,24 @@ class AgentSDK:
         *,
         task_id: str | None = None,
         title: str | None = None,
+        parent_task_id: str | None = None,
         thread_id: str | None = None,
         parent_message_id: str | None = None,
         idempotency_key: str | None = None,
-        require_delivery_ack: bool = True,
+        require_delivery_ack: bool = False,
         retry_attempts: int | None = None,
         receipt_timeout: float | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SDKResult:
+        # Default: do not fail the whole job on a slow delivery ACK.
+        # Coordinators should poll task_status / agent_status for truth.
         effective_task_id = str(task_id or "").strip() or new_task_id()
         payload = build_task_assign(
             task_id=effective_task_id,
             text=text,
             coordinator=self.username or self.account_id,
             title=title,
+            parent_task_id=parent_task_id,
             metadata=metadata,
         )
         result = await self.send_json(

@@ -25,6 +25,8 @@ network.sh - simple bash wrapper for AgentNet
 
 Usage:
   ./network.sh list
+  ./network.sh status @username
+  ./network.sh tasks [--assignee ACCOUNT] [--coordinator ACCOUNT] [--parent TASK_ID] [--status STATUS] [--limit N]
   ./network.sh metrics
   ./network.sh threads [--user USERNAME] [--query TEXT] [--limit N]
   ./network.sh thread <THREAD_ID>
@@ -50,6 +52,31 @@ case "$cmd" in
   list|ls|online)
     run_agentnet list "$@"
     ;;
+  status|agent-status|who)
+    target="${1:-}"
+    [[ -z "$target" ]] && { echo "Usage: ./network.sh status @username"; exit 2; }
+    shift || true
+    run_agentnet agent-status "$target" "$@"
+    ;;
+  tasks)
+    assignee=""; coordinator=""; parent=""; status=""; limit="20"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --assignee) assignee="${2:-}"; shift 2 ;;
+        --coordinator) coordinator="${2:-}"; shift 2 ;;
+        --parent|--parent-task-id) parent="${2:-}"; shift 2 ;;
+        --status) status="${2:-}"; shift 2 ;;
+        --limit) limit="${2:-20}"; shift 2 ;;
+        *) echo "Unknown option: $1"; exit 2 ;;
+      esac
+    done
+    args=(tasks --limit "$limit")
+    [[ -n "$assignee" ]] && args+=(--assignee-account-id "$assignee")
+    [[ -n "$coordinator" ]] && args+=(--coordinator-account-id "$coordinator")
+    [[ -n "$parent" ]] && args+=(--parent-task-id "$parent")
+    [[ -n "$status" ]] && args+=(--status "$status")
+    run_agentnet "${args[@]}"
+    ;;
   metrics|m)
     run_agentnet metrics "$@"
     ;;
@@ -68,7 +95,7 @@ case "$cmd" in
     [[ -n "$query" ]] && args+=(--query "$query")
     run_agentnet "${args[@]}"
     ;;
-  thread|status|ts)
+  thread|ts)
     thread_id="${1:-}"
     [[ -z "$thread_id" ]] && { echo "Usage: ./network.sh thread <THREAD_ID>"; exit 2; }
     shift || true

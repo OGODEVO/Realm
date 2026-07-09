@@ -40,6 +40,16 @@ DEFAULT_PYTHON = os.getenv(
 START_SCRIPT = REALM_REPO / "services" / "agent-template" / "start-opencode-agent.sh"
 DEFAULT_CONFIG = Path.home() / ".config" / "opencode" / "opencode.json"
 
+DEFAULT_REALM_SYSTEM_PROMPT = (
+    "You are a Realm network agent backed by headless OpenCode. "
+    "Treat the current inbound Realm request as the only authoritative task. "
+    "Do not recover or infer work from unrelated dirty files, prior local edits, "
+    "or generic workspace state. Ignore unrelated uncommitted changes unless the "
+    "request explicitly asks about them or they directly block the requested work. "
+    "Use prior context only from the same Realm thread or OpenCode session tied to "
+    "that thread."
+)
+
 
 mcp = FastMCP(
     "Realm Agent Launcher",
@@ -138,7 +148,6 @@ def _ensure_opencode_config(
     port: int,
     opencode_agent: str,
     opencode_config: str | None,
-    tools_note: list[str] | None,
 ) -> Path:
     config = _load_opencode_config(opencode_config)
     config.setdefault("$schema", "https://opencode.ai/config.json")
@@ -167,9 +176,6 @@ def _ensure_opencode_config(
                     if isinstance(rule, dict):
                         rule.setdefault(workspace_glob, "allow")
                 permission.setdefault("skill", "allow")
-
-    if tools_note:
-        config.setdefault("x-realm-launcher-tools", tools_note)
 
     config_path = agent_home / "opencode.json"
     _write_json(config_path, config)
@@ -301,6 +307,15 @@ def launch_opencode_agent(
 
     agent_id: stable Realm identity, without @.
     workspace: project directory OpenCode should work in.
+
+    Workspace hygiene (important):
+    - Prefer ONE writer agent per workspace. Multiple agents writing the same tree
+      is NOT clean (git conflicts, half-applied edits, lock thrash).
+    - Safe sharing: several agents with read-only review on one workspace, or
+      one writer + one reviewer that does not edit.
+    - Parallel writers: give each agent its own git worktree (or clone), e.g.
+      ../Realm-worktrees/@coder-a, not the same path for a/b/c/d/e.
+
     model/provider: either model='provider/model' or provider='deepseek', model='...'.
     opencode_agent: OpenCode primary agent name. Defaults to build; do not use subagents.
     opencode_config: optional OpenCode config JSON to copy/patch for this worker.
@@ -342,7 +357,6 @@ def launch_opencode_agent(
         port=selected_port,
         opencode_agent=opencode_agent,
         opencode_config=opencode_config or None,
-        tools_note=tools,
     )
 
     env_path = home / ".env"
@@ -357,7 +371,7 @@ def launch_opencode_agent(
         "REALM_BLOB_DIR": str(home / ".blobs" / "agent"),
         "REALM_OPENCODE_SESSION_MAP": str(home / ".realm" / f"{clean_id}-sessions.json"),
         "REALM_SYSTEM_PROMPT": system_prompt
-        or f"You are {clean_id}, a Realm network agent backed by headless OpenCode.",
+        or f"You are {clean_id}. {DEFAULT_REALM_SYSTEM_PROMPT}",
         "OPENCODE_BIN": selected_bin,
         "OPENCODE_PYTHON": DEFAULT_PYTHON,
         "OPENCODE_HOST": "127.0.0.1",

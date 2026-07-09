@@ -54,6 +54,13 @@ def task_id_from_payload(payload: Any) -> str:
     return str(decoded.get("task_id") or "").strip()
 
 
+def parent_task_id_from_payload(payload: Any) -> str:
+    decoded = decode_task_payload(payload)
+    if decoded is None:
+        return ""
+    return str(decoded.get("parent_task_id") or "").strip()
+
+
 def is_terminal_task_payload(payload: Any) -> bool:
     return task_type(payload) in TERMINAL_TASK_TYPES
 
@@ -64,6 +71,7 @@ def build_task_assign(
     text: str,
     coordinator: str | None = None,
     title: str | None = None,
+    parent_task_id: str | None = None,
     metadata: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -77,16 +85,34 @@ def build_task_assign(
         payload["coordinator"] = str(coordinator)
     if title:
         payload["title"] = str(title)
+    parent = str(parent_task_id or "").strip()
+    if parent:
+        payload["parent_task_id"] = parent
     return payload
 
 
-def build_task_progress(*, task_id: str, text: str, metadata: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def build_task_progress(
+    *,
+    task_id: str,
+    text: str,
+    percent: float | int | None = None,
+    phase: str | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    meta = dict(metadata or {})
+    if percent is not None:
+        try:
+            meta["percent"] = float(percent)
+        except (TypeError, ValueError):
+            pass
+    if phase:
+        meta["phase"] = str(phase)
     return {
         "type": TASK_PROGRESS,
         "task_id": str(task_id),
         "text": str(text),
         "event_at": utc_now_iso(),
-        "metadata": dict(metadata or {}),
+        "metadata": meta,
     }
 
 

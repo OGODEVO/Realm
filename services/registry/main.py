@@ -231,7 +231,12 @@ def _task_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any] |
     latest = ordered[-1]
     assignment = next((event for event in ordered if event.get("type") == TASK_ASSIGN), first)
     terminal = next((event for event in reversed(ordered) if str(event.get("type") or "") in TERMINAL_TASK_TYPES), None)
+    progress_events = [event for event in ordered if event.get("type") == TASK_PROGRESS]
+    latest_progress = progress_events[-1] if progress_events else None
     effective = terminal or latest
+    assign_payload = assignment.get("payload") if isinstance(assignment.get("payload"), dict) else {}
+    parent_task_id = str(assign_payload.get("parent_task_id") or "").strip() or None
+    coordinator = str(assign_payload.get("coordinator") or "").strip() or None
     return {
         "task_id": latest.get("task_id"),
         "status": effective.get("status"),
@@ -242,6 +247,10 @@ def _task_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any] |
         "thread_id": effective.get("thread_id") or assignment.get("thread_id"),
         "assignee_account_id": assignment.get("to_account_id"),
         "coordinator_account_id": assignment.get("from_account_id"),
+        "coordinator": coordinator,
+        "parent_task_id": parent_task_id,
+        "latest_progress_text": (str(latest_progress.get("text") or "").strip() or None) if latest_progress else None,
+        "progress_event_count": len(progress_events),
         "created_at": assignment.get("sent_at") or assignment.get("received_at"),
         "updated_at": effective.get("sent_at") or effective.get("received_at"),
         "message_id": effective.get("message_id"),
@@ -249,6 +258,83 @@ def _task_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any] |
         "event_count": len(ordered),
         "latest_event": effective,
     }
+
+
+def classify_agent_role(
+    *,
+    capabilities: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
+    username: str | None = None,
+) -> dict[str, Any]:
+    """Classify roster identity for company-style discovery (v0.1)."""
+    caps = {str(item).strip().lower() for item in (capabilities or []) if str(item).strip()}
+    meta = dict(metadata or {})
+    kind = str(meta.get("kind") or "").strip().lower()
+    uname = str(username or "").strip().lower().lstrip("@")
+
+    if (
+        "agent-orchestrator" in caps
+        or "realm-collaborator" in caps
+        or "collaborator" in uname
+        or kind in {"orchestrator", "realm-collaborator"}
+    ):
+        # Collaborator bridges are MCP-shaped but still company-facing orchestrators.
+        role = "orchestrator"
+        company_visible = True
+    elif "mcp-bridge" in caps or kind in {"mcp-server", "mcp-harness", "mcp"}:
+        role = "mcp-harness"
+        company_visible = False
+    elif "human-gateway" in caps or "telegram" in caps or "telegram" in uname or kind in {
+        "telegram-gateway",
+        "human-gateway",
+    }:
+        role = "human-gateway"
+        company_visible = True
+    elif kind in {"opencode-llm-agent", "worker", "coding-agent"} or caps.intersection(
+        {"llm", "coding-agent", "opencode-headless"}
+    ):
+        role = "worker"
+        company_visible = True
+    else:
+        role = "other"
+        company_visible = True
+
+    return {"role": role, "company_visible": company_visible}
+
+
+def _dedupe_online_agents(agents: list[AgentInfo]) -> list[AgentInfo]:
+    """Collapse multi-session identities into one roster row per logical agent."""
+    groups: dict[str, list[AgentInfo]] = defaultdict(list)
+    for agent in agents:
+        key = str(agent.account_id or agent.username or agent.agent_id or "").strip()
+        if not key:
+            continue
+        groups[key].append(agent)
+
+    deduped: list[AgentInfo] = []
+    for group in groups.values():
+        best = max(group, key=lambda item: (str(item.last_seen or ""), str(item.session_tag or "")))
+        metadata = dict(best.metadata or {})
+        metadata["session_count"] = len(group)
+        if len(group) > 1:
+            metadata["session_tags"] = [str(item.session_tag) for item in group if item.session_tag]
+        classification = classify_agent_role(
+            capabilities=best.capabilities,
+            metadata=metadata,
+            username=best.username,
+        )
+        metadata["role"] = classification["role"]
+        metadata["company_visible"] = classification["company_visible"]
+        best.metadata = metadata
+        deduped.append(best)
+    return sorted(
+        deduped,
+        key=lambda item: (
+            0 if (item.metadata or {}).get("company_visible", True) else 1,
+            str(item.username or item.agent_id or ""),
+            str(item.session_tag or ""),
+        ),
+    )
 
 
 class PostgresSessionStore:
@@ -955,6 +1041,7 @@ class PostgresSessionStore:
         assignee_account_id: str | None,
         coordinator_account_id: str | None,
         status: str | None,
+        parent_task_id: str | None = None,
         limit: int,
     ) -> list[dict[str, Any]]:
         if self._pool is None:
@@ -985,12 +1072,15 @@ class PostgresSessionStore:
         normalized_assignee = str(assignee_account_id or "").strip()
         normalized_coordinator = str(coordinator_account_id or "").strip()
         normalized_status = str(status or "").strip()
+        normalized_parent = str(parent_task_id or "").strip()
         if normalized_assignee:
             snapshots = [item for item in snapshots if item.get("assignee_account_id") == normalized_assignee]
         if normalized_coordinator:
             snapshots = [item for item in snapshots if item.get("coordinator_account_id") == normalized_coordinator]
         if normalized_status:
             snapshots = [item for item in snapshots if item.get("status") == normalized_status]
+        if normalized_parent:
+            snapshots = [item for item in snapshots if item.get("parent_task_id") == normalized_parent]
         snapshots.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
         return snapshots[:safe_limit]
 
@@ -1882,13 +1972,7 @@ class RegistryService:
 
         payload = {
             "generated_at": utc_now_iso(),
-            "agents": [
-                agent.to_dict()
-                for agent in sorted(
-                    self._sessions.values(),
-                    key=lambda item: (item.agent_id, item.session_tag or ""),
-                )
-            ],
+            "agents": [agent.to_dict() for agent in _dedupe_online_agents(list(self._sessions.values()))],
         }
         await self._nc.publish(msg.reply, encode_json(payload))
 
@@ -2093,6 +2177,7 @@ class RegistryService:
                 assignee_account_id=str(data.get("assignee_account_id") or "").strip() or None,
                 coordinator_account_id=str(data.get("coordinator_account_id") or "").strip() or None,
                 status=str(data.get("status") or "").strip() or None,
+                parent_task_id=str(data.get("parent_task_id") or "").strip() or None,
                 limit=limit,
             )
         except Exception:  # noqa: BLE001
@@ -2595,6 +2680,7 @@ class RegistryService:
         assignee_account_id: str | None,
         coordinator_account_id: str | None,
         status: str | None,
+        parent_task_id: str | None = None,
         limit: int,
     ) -> list[dict[str, Any]]:
         if self._store is not None:
@@ -2602,6 +2688,7 @@ class RegistryService:
                 assignee_account_id=assignee_account_id,
                 coordinator_account_id=coordinator_account_id,
                 status=status,
+                parent_task_id=parent_task_id,
                 limit=limit,
             )
         events_by_task: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -2617,12 +2704,15 @@ class RegistryService:
         normalized_assignee = str(assignee_account_id or "").strip()
         normalized_coordinator = str(coordinator_account_id or "").strip()
         normalized_status = str(status or "").strip()
+        normalized_parent = str(parent_task_id or "").strip()
         if normalized_assignee:
             snapshots = [item for item in snapshots if item.get("assignee_account_id") == normalized_assignee]
         if normalized_coordinator:
             snapshots = [item for item in snapshots if item.get("coordinator_account_id") == normalized_coordinator]
         if normalized_status:
             snapshots = [item for item in snapshots if item.get("status") == normalized_status]
+        if normalized_parent:
+            snapshots = [item for item in snapshots if item.get("parent_task_id") == normalized_parent]
         snapshots.sort(key=lambda item: str(item.get("updated_at") or item.get("created_at") or ""), reverse=True)
         return snapshots[: max(1, min(int(limit), 100))]
 

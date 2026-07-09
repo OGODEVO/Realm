@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "agentnet-realm"
 version = "0.1.1"
-description = "Minimal NATS network for agent-to-agent messaging and discovery"
+description = "AgentNet multi-agent task orchestration over NATS — permanent agents, jobs, progress, and discovery"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }

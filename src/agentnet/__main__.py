@@ -19,6 +19,7 @@ from rich.theme import Theme
 from agentnet.config import DEFAULT_NATS_URL
 from agentnet.node import AgentNode
 from agentnet.registry import (
+    get_agent_status,
     get_registry_metrics,
     get_profile,
     get_task_status,
@@ -574,6 +575,7 @@ async def _run_task_list(
     assignee_account_id: str | None,
     coordinator_account_id: str | None,
     status: str | None,
+    parent_task_id: str | None,
     limit: int,
     timeout: float,
 ) -> int:
@@ -583,6 +585,7 @@ async def _run_task_list(
             assignee_account_id=assignee_account_id,
             coordinator_account_id=coordinator_account_id,
             status=status,
+            parent_task_id=parent_task_id,
             limit=limit,
             timeout=timeout,
         )
@@ -598,18 +601,56 @@ async def _run_task_list(
     )
     table.add_column("Task", style="field.value", no_wrap=True)
     table.add_column("Status", style="field.value", no_wrap=True)
+    table.add_column("Parent", style="field.value", no_wrap=True)
     table.add_column("Assignee", style="field.value", no_wrap=True)
     table.add_column("Coordinator", style="field.value", no_wrap=True)
     table.add_column("Updated", style="dim", no_wrap=True)
-    table.add_column("Text", style="field.value")
+    table.add_column("Progress / Text", style="field.value")
     for row in rows:
+        progress = str(row.get("latest_progress_text") or "").strip()
+        text = progress or str(row.get("text") or row.get("assigned_text") or "—")
         table.add_row(
             str(row.get("task_id") or "—"),
             str(row.get("status") or "—"),
+            str(row.get("parent_task_id") or "—"),
             str(row.get("assignee_account_id") or "—"),
-            str(row.get("coordinator_account_id") or "—"),
+            str(row.get("coordinator_account_id") or row.get("coordinator") or "—"),
             str(row.get("updated_at") or "—"),
-            str(row.get("text") or row.get("assigned_text") or "—")[:120],
+            text[:120],
+        )
+    console.print(table)
+    return 0
+
+
+async def _run_agent_status(nats_url: str, target: str, limit: int, timeout: float) -> int:
+    with console.status(f"[info]Checking status for {target}…[/]", spinner="dots"):
+        result = await get_agent_status(nats_url, target, limit=limit, timeout=timeout)
+    console.print(f"[bold]{result.get('summary') or 'No summary'}[/]")
+    console.print(
+        f"[dim]online={result.get('online')} sessions={result.get('session_count')} "
+        f"account={result.get('account_id') or '—'}[/]"
+    )
+    active = result.get("active_tasks") or []
+    if not active:
+        console.print("[dim]No active tasks[/]")
+        return 0
+    table = Table(
+        title=f"[info]Active tasks for {result.get('target')}[/]",
+        border_style="bright_black",
+        title_justify="left",
+        show_edge=True,
+        expand=True,
+    )
+    table.add_column("Task", style="field.value", no_wrap=True)
+    table.add_column("Status", style="field.value", no_wrap=True)
+    table.add_column("Parent", style="field.value", no_wrap=True)
+    table.add_column("Progress", style="field.value")
+    for row in active:
+        table.add_row(
+            str(row.get("task_id") or "—"),
+            str(row.get("status") or "—"),
+            str(row.get("parent_task_id") or "—"),
+            str(row.get("latest_progress_text") or row.get("assigned_text") or row.get("text") or "—")[:140],
         )
     console.print(table)
     return 0
@@ -1038,6 +1079,16 @@ def main() -> int:
     task_status_parser.add_argument("--task-id", required=True)
     task_status_parser.add_argument("--timeout", type=float, default=2.0)
 
+    agent_status_parser = subparsers.add_parser(
+        "agent-status",
+        help="What is an agent doing? (presence + active tasks)",
+        formatter_class=_RichHelpFormatter,
+    )
+    agent_status_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
+    agent_status_parser.add_argument("target", help="@username or acct_...")
+    agent_status_parser.add_argument("--limit", type=int, default=10)
+    agent_status_parser.add_argument("--timeout", type=float, default=2.0)
+
     tasks_parser = subparsers.add_parser(
         "tasks",
         help="List registry task state",
@@ -1046,6 +1097,7 @@ def main() -> int:
     tasks_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     tasks_parser.add_argument("--assignee-account-id")
     tasks_parser.add_argument("--coordinator-account-id")
+    tasks_parser.add_argument("--parent-task-id")
     tasks_parser.add_argument("--status")
     tasks_parser.add_argument("--limit", type=int, default=20)
     tasks_parser.add_argument("--timeout", type=float, default=2.0)
@@ -1183,6 +1235,10 @@ def main() -> int:
             )
         if args.command == "task-status":
             return asyncio.run(_run_task_status(args.nats_url, args.task_id, args.timeout))
+        if args.command == "agent-status":
+            return asyncio.run(
+                _run_agent_status(args.nats_url, args.target, args.limit, args.timeout)
+            )
         if args.command == "tasks":
             return asyncio.run(
                 _run_task_list(
@@ -1190,6 +1246,7 @@ def main() -> int:
                     args.assignee_account_id,
                     args.coordinator_account_id,
                     args.status,
+                    args.parent_task_id,
                     args.limit,
                     args.timeout,
                 )

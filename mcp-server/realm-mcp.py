@@ -249,9 +249,11 @@ async def lifespan(server: FastMCP):
 mcp = FastMCP(
     name="realm-mcp",
     instructions=(
-        "Realm / AgentNet MCP bridge. "
-        "Use delegate_task for background work on other agents, await_task/task_status "
-        "for completion, and ask_text only for synchronous conversation-style requests."
+        "Realm / AgentNet MCP bridge for multi-agent work. "
+        "Jobs: use delegate_task (with parent_task_id when re-delegating). "
+        "Visibility: use agent_status(@agent) to see what someone is doing; "
+        "workers use report_progress while working; use await_task/task_status for completion. "
+        "Use ask_text only for short synchronous conversation, not long jobs."
     ),
     lifespan=lifespan,
     host=os.getenv("MCP_HOST", "127.0.0.1"),
@@ -297,9 +299,26 @@ def switch_thread(thread_id: str) -> str:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def list_online() -> str:
-    """List all agents currently online on the Realm network."""
+    """List agents currently online (one row per logical identity).
+
+    Metadata includes role, company_visible, and session_count.
+    MCP harnesses may show session_count > 1 (many bridge sessions); prefer
+    company_visible workers for delegated work, not harness clones.
+    """
     agents = await _get_sdk().list_online()
     return _json([a.to_dict() for a in agents])
+
+
+@mcp.tool()
+async def agent_status(target: str, limit: int = 10) -> str:
+    """What is this agent doing? Online presence + active/recent tasks + one-line summary.
+
+    Use this for: "What is Daniela doing?" / "Where is Sandra at?"
+
+    target: @username or acct_... account ID
+    limit: max recent tasks to include
+    """
+    return _json(await _get_sdk().agent_status(target, limit=limit))
 
 
 @mcp.tool()
@@ -385,15 +404,17 @@ async def delegate_task(
     to: str,
     text: str,
     title: str | None = None,
+    parent_task_id: str | None = None,
     thread_id: str | None = None,
     wait: bool = False,
     timeout: float = 86400.0,
 ) -> str:
-    """Assign background work to another Realm agent.
+    """Assign background work to another Realm agent (job, not chat).
 
     to: target agent (@username, acct_..., or capability:name)
     text: concrete task instructions
     title: optional short label for the task
+    parent_task_id: when re-delegating (Sandra→Daniela), pass your own task_id
     thread_id: optional audit thread; defaults to current thread
     wait: when true, block until the assigned agent returns a terminal task event
     timeout: seconds to wait when wait=true
@@ -406,13 +427,17 @@ async def delegate_task(
     tid = thread_id or _current_thread_id or sdk.new_thread_id()
     task_id = new_task_id()
     try:
+        # Delivery ACK is best-effort. Task state is authoritative in the registry.
+        # False ACK timeouts were a major source of "broken" delegation UX.
         result = await sdk.delegate_task(
             to,
             text,
             task_id=task_id,
             title=title,
+            parent_task_id=parent_task_id,
             thread_id=tid,
             parent_message_id=_last_message_id,
+            require_delivery_ack=False,
         )
     except DeliveryAckTimeout as exc:
         registry_row: dict[str, Any] | None = None
@@ -472,15 +497,47 @@ async def delegate_task(
     return _json({"ok": True, **row})
 
 
+def _unwrap_task_status(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize registry envelopes to a flat task view."""
+    task = row.get("task") if isinstance(row.get("task"), dict) else row
+    if not isinstance(task, dict):
+        return {"task_id": "", "status": "unknown"}
+    out = dict(task)
+    out.setdefault("task_id", str(row.get("task_id") or task.get("task_id") or ""))
+    return out
+
+
 @mcp.tool()
 async def task_status(task_id: str) -> str:
-    """Inspect one delegated background task by task_id."""
+    """Inspect one delegated background task by task_id.
+
+    Returns status, latest_progress_text, terminal flag, parent_task_id when known.
+    Poll this (or agent_status) instead of blocking forever on ask_text.
+    """
     sdk = _get_sdk()
     store = _task_store
     if store is None:
         raise RuntimeError("task store not initialized")
     try:
-        return _json({"ok": True, "source": "registry", **await sdk.task_status(task_id)})
+        raw = await sdk.task_status(task_id)
+        task = _unwrap_task_status(raw if isinstance(raw, dict) else {})
+        return _json(
+            {
+                "ok": True,
+                "source": "registry",
+                "task_id": task.get("task_id") or task_id,
+                "status": task.get("status"),
+                "type": task.get("type"),
+                "title": task.get("title"),
+                "text": task.get("text"),
+                "latest_progress_text": task.get("latest_progress_text"),
+                "progress_event_count": task.get("progress_event_count"),
+                "parent_task_id": task.get("parent_task_id"),
+                "terminal": task.get("terminal"),
+                "updated_at": task.get("updated_at"),
+                "task": task,
+            }
+        )
     except Exception:
         pass
     row = await store.get(task_id)
@@ -490,14 +547,91 @@ async def task_status(task_id: str) -> str:
 
 
 @mcp.tool()
-async def list_tasks(limit: int = 20) -> str:
-    """List recent delegated tasks known to this MCP harness."""
+async def report_progress(
+    to: str,
+    task_id: str,
+    text: str,
+    percent: float | None = None,
+    phase: str | None = None,
+    thread_id: str | None = None,
+) -> str:
+    """Report live progress on a task so coordinators can see what you are doing.
+
+    to: coordinator or interested party (@username / acct_...)
+    task_id: the task you are working on
+    text: short human-readable update (what you are doing now)
+    percent: optional 0-100 progress
+    phase: optional phase label (e.g. researching, coding, reviewing)
+    """
+    global _last_message_id
+    sdk = _get_sdk()
+    tid = thread_id or _current_thread_id
+    result = await sdk.report_progress(
+        to,
+        task_id,
+        text,
+        thread_id=tid,
+        parent_message_id=_last_message_id,
+        percent=percent,
+        phase=phase,
+    )
+    _last_message_id = result.message_id
+    return _json(
+        {
+            "ok": True,
+            "task_id": task_id,
+            "thread_id": tid,
+            "message_id": result.message_id,
+            "text": text,
+            "percent": percent,
+            "phase": phase,
+        }
+    )
+
+
+@mcp.tool()
+async def list_tasks(
+    limit: int = 20,
+    assignee: str | None = None,
+    coordinator: str | None = None,
+    parent_task_id: str | None = None,
+    status: str | None = None,
+) -> str:
+    """List delegated tasks. Filter by assignee/coordinator (@user or acct_), parent_task_id, status."""
     sdk = _get_sdk()
     store = _task_store
     if store is None:
         raise RuntimeError("task store not initialized")
+
+    async def _resolve_account(ref: str | None) -> str | None:
+        value = str(ref or "").strip()
+        if not value:
+            return None
+        if value.startswith("acct_") or value.lower().startswith("account:"):
+            return value.split(":", 1)[-1].strip()
+        try:
+            profile = await sdk.get_profile(value if value.startswith("@") else f"@{value}")
+            account_id = str(profile.get("account_id") or "").strip()
+            return account_id or None
+        except Exception:
+            return None
+
     try:
-        return _json({"ok": True, "source": "registry", "tasks": await sdk.list_tasks(limit=limit)})
+        assignee_account_id = await _resolve_account(assignee)
+        coordinator_account_id = await _resolve_account(coordinator)
+        return _json(
+            {
+                "ok": True,
+                "source": "registry",
+                "tasks": await sdk.list_tasks(
+                    assignee_account_id=assignee_account_id,
+                    coordinator_account_id=coordinator_account_id,
+                    parent_task_id=parent_task_id,
+                    status=status,
+                    limit=limit,
+                ),
+            }
+        )
     except Exception:
         return _json({"ok": True, "source": "local_ledger", "tasks": await store.list(limit=limit)})
 
