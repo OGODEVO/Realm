@@ -1,4 +1,4 @@
-"""Soft-clean layout hygiene checks (post OS layout reorg)."""
+"""Layout hygiene: product surface is network / mesh / apps."""
 from __future__ import annotations
 
 import unittest
@@ -8,6 +8,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class TestOsLayout(unittest.TestCase):
+    def test_kernel_present(self) -> None:
+        self.assertTrue((ROOT / "src" / "agentnet" / "sdk.py").is_file())
+        self.assertTrue((ROOT / "src" / "agentnet" / "node.py").is_file())
 
     def test_drivers_mcp_present(self) -> None:
         for name in (
@@ -24,56 +27,22 @@ class TestOsLayout(unittest.TestCase):
         self.assertTrue((ROOT / "boot" / "network.sh").is_file())
         self.assertTrue((ROOT / "boot" / "realm.sh").is_file())
 
-    def test_mesh_tools_stay_in_tools(self) -> None:
-        for name in (
-            "nba_tools.py",
-            "search_tools.py",
-            "nba_client.py",
-            "odds_client.py",
-            "team_lookup.py",
-            "log_context.py",
-        ):
-            self.assertTrue((ROOT / "tools" / name).is_file(), f"mesh tool missing: {name}")
-
-    def test_experiment_tools_in_distro(self) -> None:
-        for name in (
-            "mlb_finalize_player_layer.py",
-            "mlb_live_update_layer.py",
-            "mlb_sports_metric_layer.py",
-            "olist_semantic_layer.py",
-            "prepare_cuad_classification.py",
-            "llm_ingest.py",
-        ):
-            self.assertTrue(
-                (ROOT / "distro" / "tools" / name).is_file(),
-                f"expected distro/tools/{name}",
-            )
-            self.assertFalse(
-                (ROOT / "tools" / name).exists(),
-                f"experiment tool still under tools/: {name}",
-            )
-
-    def test_experiments_artifacts_under_distro(self) -> None:
-        if (ROOT / "experiments").exists():
-            self.fail("root experiments/ still present after finish_moves")
-        if (ROOT / "artifacts").exists():
-            self.fail("root artifacts/ still present after finish_moves")
-        # After moves they must exist under distro (if they existed originally)
-        # Allow either present under distro or never existed
-        self.assertTrue((ROOT / "distro").is_dir())
-
-    def test_stackwise_status_quarantined(self) -> None:
-        self.assertTrue((ROOT / "distro" / "STATUS.stackwise.md").is_file())
-        root_status = ROOT / "STATUS.md"
-        if root_status.is_file():
-            text = root_status.read_text(encoding="utf-8", errors="replace")
-            self.assertNotIn("stack-wise", text.lower())
-            self.assertIn("distro/STATUS.stackwise.md", text)
-
-    def test_distro_and_apps_readmes(self) -> None:
-        self.assertTrue((ROOT / "distro" / "README.md").is_file())
+    def test_apps_and_docs(self) -> None:
         self.assertTrue((ROOT / "apps" / "README.md").is_file())
-        self.assertTrue((ROOT / "docs").is_dir())
+        self.assertTrue((ROOT / "docs" / "architecture.md").is_file())
+        self.assertTrue((ROOT / "services" / "registry" / "main.py").is_file())
+
+    def test_non_product_paths_gone(self) -> None:
+        for name in ("simple-html-app", "taskflow", "agents", "tools"):
+            # Allowed only if gitignored local leftover; must not be tracked product surface
+            # Prefer absence for clean tree
+            path = ROOT / name
+            if path.exists() and name != "tools":
+                # tools may be gitignored empty; hard fail if py package present
+                pass
+        self.assertFalse((ROOT / "tools" / "nba_tools.py").exists())
+        self.assertFalse((ROOT / "simple-html-app").exists())
+        self.assertFalse((ROOT / "taskflow").exists())
 
 
 if __name__ == "__main__":

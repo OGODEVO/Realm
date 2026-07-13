@@ -28,7 +28,7 @@ name is not the product name; do not rename it casually.
 │  @workers · coordinators · human-gateway · harness sessions │
 ├─────────────────────────────────────────────────────────────┤
 │  drivers                                                    │
-│  MCP bridges · tools/* · allowlisted side effects           │
+│  MCP bridges · allowlisted side effects           │
 ├─────────────────────────────────────────────────────────────┤
 │  registry (process table)                                   │
 │  presence · profiles · threads · task snapshots · Postgres  │
@@ -41,7 +41,6 @@ name is not the product name; do not rename it casually.
 │  boot/docker-compose.yml · launchers · realm.sh shell       │
 └─────────────────────────────────────────────────────────────┘
 
-distro/  — non-kernel experiments / artifacts (not product surface)
 ```
 
 | OS idea | Realm piece | Paths |
@@ -49,12 +48,11 @@ distro/  — non-kernel experiments / artifacts (not product surface)
 | **Kernel** | Messaging node, envelopes, task helpers, subject names | `src/agentnet/` (`node.py`, `sdk.py`, `task_protocol.py`, `subjects.py`, `schema.py`) |
 | **Bus** | NATS | `boot/docker-compose.yml`, `REALM_NATS_URL` |
 | **Process table** | Registry + Postgres | `services/registry/main.py`, registry client in `src/agentnet/registry.py` |
-| **Drivers** | MCP servers + mesh tools | `drivers/mcp/`, `tools/*` (mesh); `mcp-server/` stubs |
-| **Processes** | Agents / workers | `examples/*_realm_agent.py`, `services/agent-template/`, mesh agents |
+| **Drivers** | MCP servers + mesh tools | `drivers/mcp/`; `mcp-server/` stubs |
+| **Processes** | Agents / workers | `examples/*_realm_agent.py`, `services/agent-template/` |
 | **Init** | Compose + agent homes / launcher | `boot/`, `services/agent-template/`, `drivers/mcp/realm-agent-launcher.py` |
-| **Userland / apps** | HTTP gateway, Telegram, demos | `apps/gateway/`, `src/agentnet/telegram_gateway.py`, `services/gateway/` |
+| **Userland / apps** | HTTP gateway, Telegram, demos | `apps/gateway/`, `apps/demo/`, `src/agentnet/telegram_gateway.py` |
 | **Shell** | Ops CLI | `boot/realm.sh`, `boot/network.sh`, `python -m agentnet` |
-| **Distro** | Experiments / data one-offs | `distro/` |
 
 ---
 
@@ -106,7 +104,7 @@ Anything that performs **side effects** or bridges external runtimes:
 
 - `drivers/mcp/realm-mcp.py` — mesh tools for coding agents
 - `realm-agent-launcher`, `realm-collaborator`
-- `tools/*` domain helpers
+- domain helpers live outside the kernel (app-specific)
 
 Drivers are allowlisted per process or per company distro. Processes should not
 open free SQL or arbitrary production HTTP as their default work path.
@@ -191,7 +189,7 @@ Coordinator (Codex/Grok/OC + realm MCP  or  HTTP app + AgentSDK)
         │
  Workers: OpenCode wrapper | cli_realm_agent (codex exec | grok) | humans
         │
- Drivers: MCP tools / tools/* allowlist for side effects
+ Drivers: MCP tools allowlist for side effects
 ```
 
 ---

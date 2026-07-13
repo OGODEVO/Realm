@@ -50,3 +50,12 @@ start_mesh_trio.sh
 # Large local datasets / experiment dumps
 distro/artifacts/
 distro/experiments/
+
+# Not part of the Realm product surface
+simple-html-app/
+taskflow/
+agents/
+distro/
+
+# Domain app tools (not mesh product)
+tools/
