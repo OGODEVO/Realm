@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import json
 import sys
+from typing import Any
 
 from nats.aio.client import Client as NATS
 from rich.console import Console
@@ -563,10 +564,61 @@ async def _run_message_search(
 # task status/list
 # ──────────────────────────────────────────────
 
-async def _run_task_status(nats_url: str, task_id: str, timeout: float) -> int:
+def _print_task_status_human(result: dict[str, Any]) -> None:
+    """Pretty task_status with progress timeline (observability)."""
+    task = result.get("task") if isinstance(result.get("task"), dict) else result
+    if not isinstance(task, dict):
+        console.print(RichJSON(json.dumps(result, indent=2)))
+        return
+    console.print(
+        f"[bold]{task.get('task_id') or '—'}[/]  "
+        f"status=[accent]{task.get('status') or '—'}[/]  "
+        f"terminal={task.get('terminal')}  "
+        f"events={task.get('event_count')}  "
+        f"progress_n={task.get('progress_event_count')}"
+    )
+    console.print(f"[dim]title[/] {task.get('title') or '—'}")
+    console.print(f"[dim]latest[/] {task.get('latest_progress_text') or task.get('text') or '—'}")
+    hist = task.get("progress_history") or []
+    if hist:
+        table = Table(
+            title="[info]progress_history[/]",
+            border_style="bright_black",
+            title_justify="left",
+            show_edge=True,
+            expand=True,
+        )
+        table.add_column("#", style="dim", width=3)
+        table.add_column("When", style="dim", no_wrap=True)
+        table.add_column("Phase", style="accent", no_wrap=True)
+        table.add_column("Text", style="field.value")
+        for i, row in enumerate(hist, start=1):
+            if not isinstance(row, dict):
+                continue
+            table.add_row(
+                str(i),
+                str(row.get("sent_at") or "—")[:19],
+                str(row.get("phase") or "—"),
+                str(row.get("text") or "—")[:140],
+            )
+        console.print(table)
+    else:
+        console.print("[dim]No progress_history yet[/]")
+
+
+async def _run_task_status(
+    nats_url: str,
+    task_id: str,
+    timeout: float,
+    *,
+    raw: bool = False,
+) -> int:
     with console.status("[info]Fetching task status…[/]", spinner="dots"):
         result = await get_task_status(nats_url, task_id=task_id, timeout=timeout)
-    console.print(RichJSON(json.dumps(result, indent=2)))
+    if raw:
+        console.print(RichJSON(json.dumps(result, indent=2)))
+    else:
+        _print_task_status_human(result if isinstance(result, dict) else {"task": result})
     return 0
 
 
@@ -578,48 +630,75 @@ async def _run_task_list(
     parent_task_id: str | None,
     limit: int,
     timeout: float,
+    *,
+    watch: bool = False,
+    watch_interval: float = 2.0,
+    watch_seconds: float = 0.0,
 ) -> int:
-    with console.status("[info]Fetching tasks…[/]", spinner="dots"):
-        rows = await list_tasks(
-            nats_url,
-            assignee_account_id=assignee_account_id,
-            coordinator_account_id=coordinator_account_id,
-            status=status,
-            parent_task_id=parent_task_id,
-            limit=limit,
-            timeout=timeout,
-        )
-    if not rows:
-        console.print("[dim]No matching tasks found[/]")
-        return 0
-    table = Table(
-        title=f"[info]Tasks[/]  [dim]({len(rows)})[/]",
-        border_style="bright_black",
-        title_justify="left",
-        show_edge=True,
-        expand=True,
-    )
-    table.add_column("Task", style="field.value", no_wrap=True)
-    table.add_column("Status", style="field.value", no_wrap=True)
-    table.add_column("Parent", style="field.value", no_wrap=True)
-    table.add_column("Assignee", style="field.value", no_wrap=True)
-    table.add_column("Coordinator", style="field.value", no_wrap=True)
-    table.add_column("Updated", style="dim", no_wrap=True)
-    table.add_column("Progress / Text", style="field.value")
-    for row in rows:
-        progress = str(row.get("latest_progress_text") or "").strip()
-        text = progress or str(row.get("text") or row.get("assigned_text") or "—")
-        table.add_row(
-            str(row.get("task_id") or "—"),
-            str(row.get("status") or "—"),
-            str(row.get("parent_task_id") or "—"),
-            str(row.get("assignee_account_id") or "—"),
-            str(row.get("coordinator_account_id") or row.get("coordinator") or "—"),
-            str(row.get("updated_at") or "—"),
-            text[:120],
-        )
-    console.print(table)
-    return 0
+    import time as _time
+
+    deadline = None if not watch or watch_seconds <= 0 else (_time.time() + watch_seconds)
+    last_fp = ""
+    while True:
+        with console.status("[info]Fetching tasks…[/]", spinner="dots"):
+            rows = await list_tasks(
+                nats_url,
+                assignee_account_id=assignee_account_id,
+                coordinator_account_id=coordinator_account_id,
+                status=status,
+                parent_task_id=parent_task_id,
+                limit=limit,
+                timeout=timeout,
+            )
+        fp = json.dumps(rows, default=str, sort_keys=True)
+        if fp != last_fp or not watch:
+            if watch:
+                console.clear()
+                console.print(
+                    f"[dim]realm jobs --watch[/]  interval={watch_interval:g}s  "
+                    f"{_time.strftime('%H:%M:%S')}"
+                )
+            if not rows:
+                console.print("[dim]No matching tasks found[/]")
+            else:
+                table = Table(
+                    title=f"[info]Tasks[/]  [dim]({len(rows)})[/]",
+                    border_style="bright_black",
+                    title_justify="left",
+                    show_edge=True,
+                    expand=True,
+                )
+                table.add_column("Task", style="field.value", no_wrap=True)
+                table.add_column("Status", style="field.value", no_wrap=True)
+                table.add_column("Parent", style="field.value", no_wrap=True)
+                table.add_column("Assignee", style="field.value", no_wrap=True)
+                table.add_column("Coordinator", style="field.value", no_wrap=True)
+                table.add_column("Updated", style="dim", no_wrap=True)
+                table.add_column("n", style="dim", width=3)
+                table.add_column("Progress / Text", style="field.value")
+                for row in rows:
+                    progress = str(row.get("latest_progress_text") or "").strip()
+                    text = progress or str(row.get("text") or row.get("assigned_text") or "—")
+                    table.add_row(
+                        str(row.get("task_id") or "—")[-22:],
+                        str(row.get("status") or "—"),
+                        str(row.get("parent_task_id") or "—")[-12:],
+                        str(row.get("assignee_account_id") or "—")[-14:],
+                        str(row.get("coordinator_account_id") or row.get("coordinator") or "—")[-14:],
+                        str(row.get("updated_at") or "—")[:19],
+                        str(row.get("progress_event_count") or "0"),
+                        text[:100],
+                    )
+                console.print(table)
+                console.print(
+                    "[dim]tip: agentnet task-status --task-id <id>  → progress_history timeline[/]"
+                )
+            last_fp = fp
+        if not watch:
+            return 0
+        if deadline is not None and _time.time() >= deadline:
+            return 0
+        await asyncio.sleep(max(0.5, watch_interval))
 
 
 async def _run_agent_status(nats_url: str, target: str, limit: int, timeout: float) -> int:
@@ -1078,6 +1157,11 @@ def main() -> int:
     task_status_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
     task_status_parser.add_argument("--task-id", required=True)
     task_status_parser.add_argument("--timeout", type=float, default=2.0)
+    task_status_parser.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print full JSON instead of human timeline view",
+    )
 
     agent_status_parser = subparsers.add_parser(
         "agent-status",
@@ -1091,7 +1175,7 @@ def main() -> int:
 
     tasks_parser = subparsers.add_parser(
         "tasks",
-        help="List registry task state",
+        help="List registry task state (add --watch for live board)",
         formatter_class=_RichHelpFormatter,
     )
     tasks_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
@@ -1101,6 +1185,23 @@ def main() -> int:
     tasks_parser.add_argument("--status")
     tasks_parser.add_argument("--limit", type=int, default=20)
     tasks_parser.add_argument("--timeout", type=float, default=2.0)
+    tasks_parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Refresh live board until Ctrl-C (or --watch-seconds)",
+    )
+    tasks_parser.add_argument(
+        "--watch-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between refreshes when --watch (default 2)",
+    )
+    tasks_parser.add_argument(
+        "--watch-seconds",
+        type=float,
+        default=0.0,
+        help="Stop watching after N seconds (0 = forever)",
+    )
 
     send_parser = subparsers.add_parser("send", help="Send a message", formatter_class=_RichHelpFormatter)
     send_parser.add_argument("--nats-url", default=DEFAULT_NATS_URL)
@@ -1234,7 +1335,14 @@ def main() -> int:
                 )
             )
         if args.command == "task-status":
-            return asyncio.run(_run_task_status(args.nats_url, args.task_id, args.timeout))
+            return asyncio.run(
+                _run_task_status(
+                    args.nats_url,
+                    args.task_id,
+                    args.timeout,
+                    raw=bool(getattr(args, "raw", False)),
+                )
+            )
         if args.command == "agent-status":
             return asyncio.run(
                 _run_agent_status(args.nats_url, args.target, args.limit, args.timeout)
@@ -1249,6 +1357,9 @@ def main() -> int:
                     args.parent_task_id,
                     args.limit,
                     args.timeout,
+                    watch=bool(getattr(args, "watch", False)),
+                    watch_interval=float(getattr(args, "watch_interval", 2.0) or 2.0),
+                    watch_seconds=float(getattr(args, "watch_seconds", 0.0) or 0.0),
                 )
             )
         if args.command == "send":

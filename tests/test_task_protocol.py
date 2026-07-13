@@ -72,6 +72,49 @@ class TaskProtocolTests(unittest.TestCase):
         self.assertEqual(task_type(payload), TASK_RESULT)
         self.assertEqual(task_id_from_payload(payload), "task_123")
 
+    def test_registry_snapshot_includes_progress_history(self) -> None:
+        """Import registry helpers offline and require progress_history on snapshot."""
+        import importlib.util
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "services" / "registry" / "main.py"
+        spec = importlib.util.spec_from_file_location("realm_registry_main_hist", path)
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        rows = []
+        for i, payload in enumerate(
+            [
+                build_task_assign(task_id="task_h", text="do it", coordinator="boss"),
+                build_task_progress(task_id="task_h", text="ack", phase="ack"),
+                build_task_progress(task_id="task_h", text="tool:x", phase="tool"),
+                build_task_result(task_id="task_h", text="done"),
+            ]
+        ):
+            rows.append(
+                {
+                    "payload": payload,
+                    "message_id": f"m{i}",
+                    "sent_at": f"2026-07-12T10:0{i}:00Z",
+                    "received_at": f"2026-07-12T10:0{i}:00Z",
+                    "from_account_id": "a",
+                    "to_account_id": "b",
+                    "thread_id": "t",
+                    "parent_message_id": None,
+                    "to_agent": None,
+                }
+            )
+        events = [mod._task_event_from_message_row(r) for r in rows]
+        snap = mod._task_snapshot_from_events(events)
+        assert snap is not None
+        self.assertEqual(snap["progress_event_count"], 2)
+        self.assertEqual(len(snap["progress_history"]), 2)
+        self.assertEqual(snap["progress_history"][0]["phase"], "ack")
+        self.assertEqual(snap["progress_history"][1]["phase"], "tool")
+        self.assertEqual(len(snap["event_history"]), 4)
+        self.assertTrue(snap["terminal"])
+
     def test_agent_status_summary_lines(self) -> None:
         self.assertEqual(_agent_status_summary(label="@d", online=False, active_tasks=[]), "@d is offline")
         self.assertEqual(_agent_status_summary(label="@d", online=True, active_tasks=[]), "@d is online and idle")

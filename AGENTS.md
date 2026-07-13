@@ -56,8 +56,9 @@ employees — do not treat every `@medusa-bridge` session as a coworker.
 CLI:
 
 ```bash
-./network.sh list
-./network.sh status @future-oasis-gpt55
+./boot/realm.sh ps
+./boot/realm.sh status @future-oasis-gpt55
+# compat: ./network.sh list|status → boot/network.sh
 ```
 
 `agent_status` returns:

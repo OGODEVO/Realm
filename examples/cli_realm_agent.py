@@ -115,6 +115,8 @@ BRAIN_TIMEOUT = float(os.getenv("REALM_BRAIN_TIMEOUT", "86400"))
 BLOB_DIR = os.getenv("REALM_BLOB_DIR") or None
 PROGRESS_CHUNK = max(40, int(os.getenv("REALM_PROGRESS_CHUNK", "280")))
 PROGRESS_INTERVAL_S = float(os.getenv("REALM_PROGRESS_INTERVAL_S", "2.0"))
+# Heartbeat so coordinators see more than a silent "working" during long brains.
+PROGRESS_HEARTBEAT_S = float(os.getenv("REALM_PROGRESS_HEARTBEAT_S", "30"))
 
 SYSTEM_PROMPT = os.getenv(
     "REALM_SYSTEM_PROMPT",
@@ -475,6 +477,7 @@ async def run_brain(
     stderr_chunks: list[str] = []
     last_progress = 0.0
     loop = asyncio.get_running_loop()
+    started = loop.time()
 
     async def _pump(
         stream: asyncio.StreamReader,
@@ -495,7 +498,7 @@ async def run_brain(
             phase, text = classify_progress_line(line)
             if not text:
                 continue
-            # Throttle noisy streams but always emit tool lines promptly.
+            # Always emit tool lines promptly; throttle chatty non-tool streams.
             if phase != "tool" and (now - last_progress) < PROGRESS_INTERVAL_S:
                 continue
             last_progress = now
@@ -509,6 +512,32 @@ async def run_brain(
                 metadata={"source": f"{RUNTIME}-cli"},
             )
 
+    async def _heartbeat() -> None:
+        """Emit progress every ~30s so long silent runs still show as alive."""
+        nonlocal last_progress
+        if not task_id or PROGRESS_HEARTBEAT_S <= 0:
+            return
+        while True:
+            await asyncio.sleep(PROGRESS_HEARTBEAT_S)
+            if proc.returncode is not None:
+                return
+            now = loop.time()
+            elapsed = max(0, int(now - started))
+            # Skip if we just emitted something (tool/line) recently.
+            if (now - last_progress) < (PROGRESS_HEARTBEAT_S * 0.5):
+                continue
+            last_progress = now
+            await emit_progress(
+                sdk,
+                to_agent,
+                thread_id=thread_id,
+                task_id=task_id,
+                text=f"HEARTBEAT: still running ({RUNTIME}, {elapsed}s elapsed)",
+                phase="status",
+                metadata={"source": f"{RUNTIME}-cli", "heartbeat": True, "elapsed_s": elapsed},
+            )
+
+    heartbeat_task = asyncio.create_task(_heartbeat())
     try:
         await asyncio.wait_for(
             asyncio.gather(
@@ -524,6 +553,9 @@ async def run_brain(
     except asyncio.CancelledError:
         await stop_subprocess(proc)
         raise
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
 
     stdout = "".join(stdout_chunks).strip()
     stderr = "".join(stderr_chunks).strip()
@@ -555,7 +587,12 @@ async def handle_message(sdk: AgentSDK, msg: Any) -> None:
         task_id = str(msg.payload.get("task_id") or "")
     incoming_task_type = task_type(msg.payload)
     is_task_assignment = incoming_task_type == TASK_ASSIGN
-    should_process = msg.kind == "request" or is_task_assignment
+    # Jobs (task.assign), RPC ask_text (request), and plain DMs (direct with text).
+    should_process = (
+        is_task_assignment
+        or msg.kind == "request"
+        or (msg.kind == "direct" and bool(text.strip()))
+    )
 
     if is_cancel_msg(msg.payload):
         cancel_id = extract_cancel_task_id(msg.payload)

@@ -1,16 +1,21 @@
-# Realm 0.1 — agent company network
+# Realm OS 0.1 — job OS for agents working for you
 
-**Realm** (AgentNet) is a multi-agent orchestration bus: permanent agents with durable identities, **jobs** (not just chat), live progress, and shared registry truth over NATS.
+**Realm** is a **process/job operating system** for permanent agents: durable identities, delegated **jobs**, live progress, and shared registry truth. NATS is the **kernel bus** only — not the product surface for browsers or partners.
+
+Python package name remains **`agentnet`** (import `agentnet.sdk`, etc.).
 
 | Docs | Audience |
 |------|----------|
+| **[docs/process-contract.md](docs/process-contract.md)** | **Freeze** identity + job lifecycle + delivery (forward-compat) |
+| **[docs/architecture.md](docs/architecture.md)** | OS layers: kernel, registry, drivers, processes, apps |
+| **[docs/http-gateway.md](docs/http-gateway.md)** | FastAPI / REST integration (API keys; never NATS from browsers) |
 | **[AGENTS.md](AGENTS.md)** | **Required** operating guide for every agent on the mesh |
 | **[skills.md](skills.md)** | Skills & capabilities map (hire / offer / tools) |
 | **[ORCHESTRATION.md](ORCHESTRATION.md)** | Coordinator/worker patterns (delegate → progress → result) |
 | **[agent.md](agent.md)** | Context handoff for the **next agent working on this repo** |
 | [CHANGELOG.md](CHANGELOG.md) | 0.1 release notes |
 
-### Stable loop
+### Job contract (stable loop)
 
 ```text
 delegate_task  →  task.progress (report_progress)  →  task.result / blocked / failed
@@ -18,23 +23,26 @@ delegate_task  →  task.progress (report_progress)  →  task.result / blocked 
                  agent_status / task_status          await_task / task_status
 ```
 
+Brains (OpenCode, Codex, Grok, humans, rules bots) are **adapters** behind the same contract. See [docs/process-contract.md](docs/process-contract.md).
+
 ### Quick commands
 
 ```bash
-# Start the network (Docker required)
-docker compose -f docker/docker-compose.yml up -d
+# Boot the bus (Docker required)
+docker compose -f boot/docker-compose.yml up -d
 
 # Who is online / what are they doing / open jobs
-./network.sh list
-./network.sh status @username
-./network.sh tasks --limit 20
+./boot/realm.sh ps
+./boot/realm.sh status @username
+./boot/realm.sh jobs --limit 20
+# (compat: ./network.sh list|status|tasks → boot/network.sh)
 ```
 
 ---
 
 # Realm (AgentNet)
 
-Agent-to-agent messaging over NATS. Discovery, threads, request-response, streaming, task protocol.
+Installable SDK and mesh tools: agent-to-agent messaging over NATS, discovery, threads, request-response, streaming, task protocol.
 
 ## Quickstart
 
@@ -43,8 +51,8 @@ Agent-to-agent messaging over NATS. Discovery, threads, request-response, stream
 pip install -e .
 # or: pip install git+ssh://git@github.com/OGODEVO/Realm.git
 
-# Start the network (Docker required)
-docker compose -f docker/docker-compose.yml up -d
+# Boot the bus (Docker required)
+docker compose -f boot/docker-compose.yml up -d
 ```
 
 ## Plugin (recommended)
@@ -88,7 +96,7 @@ async with AgentSDK(
 
 ```bash
 REALM_NATS_URL=nats://agentnet_secret_token@localhost:4222 \
-  python mcp-server/realm-mcp.py
+  python drivers/mcp/realm-mcp.py
 ```
 
 20 tools:
@@ -142,7 +150,7 @@ Stdio (default) or SSE:
 ```bash
 MCP_TRANSPORT=sse MCP_HOST=100.84.141.84 MCP_PORT=8104 \
   REALM_NATS_URL=nats://agentnet_secret_token@localhost:4222 \
-  python mcp-server/realm-mcp.py
+  python drivers/mcp/realm-mcp.py
 ```
 
 ## Telegram Gateway

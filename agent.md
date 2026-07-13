@@ -9,19 +9,32 @@ Load this first when you open the repo. Then skim the “Do not break” and “
 
 ## What this project is
 
-**Realm / AgentNet** = multi-agent **company bus** over NATS:
+**Realm OS** = a **job OS for agents working for you**. NATS is the **kernel bus**; the product is processes, jobs, drivers, and apps — not a messaging lab.
 
-- Durable identities (`@username` / `account_id`)
-- Messaging, threads, receipts
-- **Jobs:** `task.assign` → `task.progress` → `task.result|blocked|failed`
-- Registry + Postgres as shared truth for presence + task snapshots
-- MCP bridges so CLI agents (Codex / Grok / OpenCode) can coordinate
+| Layer | Meaning |
+|-------|---------|
+| Kernel | `src/agentnet` + `task_protocol` + subjects |
+| Process table | Registry + Postgres (presence, task snapshots) |
+| Drivers | MCP + `tools/*` (side-effect allowlist) |
+| Processes | Agents honoring the job contract |
+| Apps | FastAPI HTTP gateway, Telegram, company UIs |
+| Dogfood | Same OS + company distro (not a kernel fork) |
 
-**Package:** `agentnet-realm` **0.1.1** (`pyproject.toml`)  
+**Freeze contract (read first for agent work):** [docs/process-contract.md](docs/process-contract.md)
+
+Also: [docs/architecture.md](docs/architecture.md), [docs/http-gateway.md](docs/http-gateway.md).
+
+Core surface:
+
+- Durable identities (`@username` / `account_id`, capabilities, role)
+- Delivery via account inbox / capability subjects; **threads are conversation/audit, not routing**
+- **Jobs:** `task.assign` → `task.progress` → `task.result|blocked|failed` (must finish once)
+- Brains are adapters (OpenCode / `codex exec` / `grok` / human Telegram) behind one contract
+- MCP bridges so CLI agents can coordinate without owning the bus
+
+**Package:** `agentnet-realm` **0.1.1** (`pyproject.toml`); import package name **`agentnet`** (do not rename)  
 **Hub (this machine):** NATS `127.0.0.1:4222` + Tailscale `100.84.141.84:4222`  
 **Remote clients:** same auth, URL `nats://agentnet_secret_token@100.84.141.84:4222`
-
-Product vision (owner): permanent specialist agents, horizontal/vertical delegation, live “what is X doing?”, forward-compatible brains (OpenCode / `codex exec` / `grok` headless) behind one job contract.
 
 ---
 
@@ -30,28 +43,35 @@ Product vision (owner): permanent specialist agents, horizontal/vertical delegat
 | File | For whom | Purpose |
 |------|----------|---------|
 | **This file (`agent.md`)** | **Next repo agent** | Load context, state, where to edit |
+| [docs/process-contract.md](docs/process-contract.md) | Architects + adapters | **Frozen** process/job contract |
+| [docs/architecture.md](docs/architecture.md) | Everyone | Realm OS mental model |
+| [docs/http-gateway.md](docs/http-gateway.md) | App engineers | REST + API keys vs mesh token |
 | [AGENTS.md](AGENTS.md) | Agents **on the mesh** | How to use the network (jobs ≠ chat) |
 | [skills.md](skills.md) | Mesh + coordinators | Skills/capabilities map |
 | [ORCHESTRATION.md](ORCHESTRATION.md) | Mesh patterns | parent_task_id, pipeline, parallel |
 | [CHANGELOG.md](CHANGELOG.md) | Humans | 0.1.x notes |
 | [NETWORK_CLI_GUIDE.md](NETWORK_CLI_GUIDE.md) | Ops | CLI deep dive |
-| [README.md](README.md) | Everyone | Quickstart + 0.1 header |
+| [README.md](README.md) | Everyone | Quickstart + OS header |
 
 ---
 
 ## Repo layout (high signal)
 
 ```text
-src/agentnet/           # SDK, node, registry client, task_protocol, CLI
-services/registry/      # Registry service (presence, threads, task snapshots) — Docker
+src/agentnet/           # Kernel: SDK, node, registry client, task_protocol, CLI
+services/registry/      # Process table service (presence, threads, task snapshots)
 services/agent-template/# Durable worker homes: start-opencode-agent.sh, start-cli-agent.sh
-mcp-server/             # realm-mcp.py, realm-agent-launcher.py, realm-collaborator.py
+drivers/mcp/            # MCP drivers (realm-mcp, launcher, collaborator)
+mcp-server/             # Compat stubs → drivers/mcp/
+boot/                   # Init: docker-compose.yml, network.sh, realm.sh
+apps/                   # Userland (FastAPI gateway, …)
+docs/                   # OS contract + architecture
+distro/                 # Non-kernel experiments / artifacts / misfiled STATUS
 examples/
   opencode_realm_agent.py   # OpenCode-backed worker
   cli_realm_agent.py        # Codex / Grok headless worker
-docker/docker-compose.yml   # nats + postgres + registry
-network.sh                  # thin CLI wrapper (list, status, tasks, …)
-tests/                      # unittest (run with PYTHONPATH=src)
+network.sh              # Compat stub → boot/network.sh
+tests/                  # unittest (run with PYTHONPATH=src)
 scripts/smoke_task_loop.py  # offline assign→progress→result smoke
 ```
 
@@ -84,7 +104,7 @@ Implementation surface:
 - SDK: `src/agentnet/sdk.py` (`delegate_task`, `report_progress`, `agent_status`, `list_tasks`)
 - Registry client: `src/agentnet/registry.py` (`get_agent_status`, list filters)
 - Registry server: `services/registry/main.py` (snapshots, online **dedupe**, **role** classification)
-- MCP: `mcp-server/realm-mcp.py`
+- MCP: `drivers/mcp/realm-mcp.py` (compat: `mcp-server/`)
 
 ---
 
@@ -93,7 +113,8 @@ Implementation surface:
 **Branch:** `codex/realm-ack-timeout-recovery` (plus large uncommitted 0.1 orchestration work)
 
 **Tests (as of last handoff):**  
-`PYTHONPATH=src python3 -m unittest discover -s tests -q` → **43 OK**
+`PYTHONPATH=src python3 -m unittest discover -s tests -q` → **50 OK**  
+Gateway unit (optional deps): `PYTHONPATH=src:. python3 -m unittest apps.gateway.test_gateway_unit -q`
 
 ### Shipped in this working tree (0.1 focus) — treat as intentional
 
@@ -112,13 +133,24 @@ Implementation surface:
 - Registry Docker image rebuilt with dedupe + roles (needs rebuild again if you change `services/registry/main.py`)
 - NATS/Postgres typically left running
 
+### Observability (landed)
+
+- Workers: ack + tool lines + **~30s HEARTBEAT** (`REALM_PROGRESS_HEARTBEAT_S`, cli + opencode adapters)
+- `task_status` snapshot includes **`progress_history`** + **`event_history`**
+- Watch: `./boot/realm.sh jobs --watch` · `./boot/realm.sh task <task_id>`
+- Rebuild registry image after pulling so live hub serves history fields
+
 ### Not done / 0.2 candidates (do not claim fixed)
 
 - Exclusive **job lease** (multi-session same identity can still race)
 - Auto-hide mcp-harness from default list (labeled only today)
-- Pretty stand-up UI board
+- Rich web stand-up board (CLI watch is enough for v0.1)
 - Full OpenCode path inside `cli_realm_agent.py` (intentionally points at `opencode_realm_agent.py`)
 - Commit/push of this whole 0.1 set (many files still modified/untracked)
+- **MCP ↔ tools allowlist sync** (drivers register tools; processes refresh allowlists) — note only
+- **Live ShopOps demo workers** online for gateway `DEMO_ROUTES` (`@order_agent` etc.)
+- **Package rename** `agentnet` → `realm` (frozen until migration plan)
+- One-command live smoke: `POST /v1/jobs` → progress → terminal
 
 ---
 
@@ -170,7 +202,7 @@ PYTHONPATH=src python3 scripts/smoke_task_loop.py
 ./network.sh metrics
 
 # if you changed services/registry/main.py
-docker compose -f docker/docker-compose.yml up -d --build registry
+docker compose -f boot/docker-compose.yml up -d --build registry
 # wait for agents to re-hello, then list again
 ```
 
@@ -197,10 +229,10 @@ Headless brains on this machine:
 | Coordinator SDK API | `src/agentnet/sdk.py` |
 | Status / list_tasks client | `src/agentnet/registry.py` |
 | Online roster / roles / GC | `services/registry/main.py` → rebuild Docker |
-| MCP tools | `mcp-server/realm-mcp.py` |
+| MCP tools | `drivers/mcp/realm-mcp.py` |
 | OpenCode worker | `examples/opencode_realm_agent.py` |
 | Codex/Grok worker | `examples/cli_realm_agent.py` |
-| Human CLI | `src/agentnet/__main__.py`, `network.sh` |
+| Human CLI | `src/agentnet/__main__.py`, `boot/network.sh`, `boot/realm.sh` |
 | Mesh law for agents using the network | `AGENTS.md` (not this file) |
 
 ---

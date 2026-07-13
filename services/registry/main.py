@@ -237,6 +237,38 @@ def _task_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any] |
     assign_payload = assignment.get("payload") if isinstance(assignment.get("payload"), dict) else {}
     parent_task_id = str(assign_payload.get("parent_task_id") or "").strip() or None
     coordinator = str(assign_payload.get("coordinator") or "").strip() or None
+    # Compact timeline for observability (not full message payloads).
+    progress_history: list[dict[str, Any]] = []
+    for event in progress_events:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        phase = str(meta.get("phase") or "").strip() or None
+        percent = meta.get("percent")
+        progress_history.append(
+            {
+                "type": event.get("type"),
+                "text": str(event.get("text") or "").strip() or None,
+                "phase": phase,
+                "percent": percent,
+                "sent_at": event.get("sent_at") or event.get("received_at"),
+                "message_id": event.get("message_id"),
+            }
+        )
+    # Full ordered event summary (assign/progress/terminal) for task_status watchers.
+    event_history: list[dict[str, Any]] = []
+    for event in ordered:
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        meta = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        event_history.append(
+            {
+                "type": event.get("type"),
+                "status": event.get("status"),
+                "text": str(event.get("text") or "").strip() or None,
+                "phase": str(meta.get("phase") or "").strip() or None,
+                "sent_at": event.get("sent_at") or event.get("received_at"),
+                "message_id": event.get("message_id"),
+            }
+        )
     return {
         "task_id": latest.get("task_id"),
         "status": effective.get("status"),
@@ -251,6 +283,8 @@ def _task_snapshot_from_events(events: list[dict[str, Any]]) -> dict[str, Any] |
         "parent_task_id": parent_task_id,
         "latest_progress_text": (str(latest_progress.get("text") or "").strip() or None) if latest_progress else None,
         "progress_event_count": len(progress_events),
+        "progress_history": progress_history,
+        "event_history": event_history,
         "created_at": assignment.get("sent_at") or assignment.get("received_at"),
         "updated_at": effective.get("sent_at") or effective.get("received_at"),
         "message_id": effective.get("message_id"),

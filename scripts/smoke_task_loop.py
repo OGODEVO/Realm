@@ -185,6 +185,15 @@ def main() -> int:
         "final keeps latest_progress_text",
         final is not None and final.get("latest_progress_text") == "tool:write_file tests/test_api.py",
     )
+    hist = (final or {}).get("progress_history") or []
+    ok &= _check("progress_history len", len(hist) == 3, detail=str(len(hist)))
+    ok &= _check(
+        "progress_history phases",
+        [h.get("phase") for h in hist] == ["ack", "working", "tool"],
+        detail=str([h.get("phase") for h in hist]),
+    )
+    ev = (final or {}).get("event_history") or []
+    ok &= _check("event_history has assign+progress+result", len(ev) == 5, detail=str(len(ev)))
 
     print("3. agent_status summary")
     offline = _agent_status_summary(label="@daniela", online=False, active_tasks=[])

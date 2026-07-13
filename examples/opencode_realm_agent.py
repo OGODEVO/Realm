@@ -341,6 +341,10 @@ async def poll_and_stream(
 ) -> None:
     """Export-poll for tool/text activity and post registry-visible progress."""
     seen: set[str] = set()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    last_emit = started
+    heartbeat_s = float(os.getenv("REALM_PROGRESS_HEARTBEAT_S", "30"))
     while not done.is_set():
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -387,6 +391,7 @@ async def poll_and_stream(
                     # Skip pure thinking noise unless no task (chat) — still useful lightly.
                     if phase == "thinking" and task_id:
                         continue
+                    last_emit = loop.time()
                     await emit_progress(
                         sdk,
                         to_agent,
@@ -396,6 +401,19 @@ async def poll_and_stream(
                         phase=phase,
                         metadata={"source": "opencode-export", "part_type": phase},
                     )
+            # Heartbeat when tools go silent for too long.
+            if task_id and heartbeat_s > 0 and (loop.time() - last_emit) >= heartbeat_s:
+                elapsed = int(loop.time() - started)
+                last_emit = loop.time()
+                await emit_progress(
+                    sdk,
+                    to_agent,
+                    thread_id=thread_id,
+                    task_id=task_id,
+                    text=f"HEARTBEAT: still running (opencode, {elapsed}s elapsed)",
+                    phase="status",
+                    metadata={"source": "opencode-export", "heartbeat": True, "elapsed_s": elapsed},
+                )
         except Exception:
             pass
         await asyncio.sleep(EXPORT_POLL_S)

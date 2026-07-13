@@ -23,9 +23,9 @@ Repo copies of Realm MCP scripts (what configs should invoke):
 
 | MCP server | Script |
 |------------|--------|
-| `realm` | `/Users/a.developer/Documents/Realm/mcp-server/realm-mcp.py` |
-| `realm-agent-launcher` | `.../mcp-server/realm-agent-launcher.py` |
-| `realm-collaborator` | `.../mcp-server/realm-collaborator.py` |
+| `realm` | `/Users/a.developer/Documents/Realm/drivers/mcp/realm-mcp.py` |
+| `realm-agent-launcher` | `.../drivers/mcp/realm-agent-launcher.py` |
+| `realm-collaborator` | `.../drivers/mcp/realm-collaborator.py` |
 
 Shared env almost always:
 
@@ -61,7 +61,7 @@ MCP block keys already used on this hub:
 
 | Key in `mcp` | Points at |
 |--------------|-----------|
-| `realm` | `mcp-server/realm-mcp.py` + `REALM_NATS_URL` |
+| `realm` | `drivers/mcp/realm-mcp.py` + `REALM_NATS_URL` |
 | `realm-agent-launcher` | launcher script + `REALM_REPO`, `REALM_AGENT_LAUNCHER_HOME` |
 | `realm-collaborator` | collaborator script + blob dir |
 
@@ -84,7 +84,7 @@ Realm entries are under `[mcp_servers.*]`:
 ```toml
 [mcp_servers.realm]
 command = "/opt/homebrew/bin/python3.11"
-args = ["/Users/a.developer/Documents/Realm/mcp-server/realm-mcp.py"]
+args = ["/Users/a.developer/Documents/Realm/drivers/mcp/realm-mcp.py"]
 startup_timeout_sec = 120
 
 [mcp_servers.realm.env]

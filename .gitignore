@@ -46,3 +46,7 @@ realm
 node_modules/
 realm
 start_mesh_trio.sh
+
+# Large local datasets / experiment dumps
+distro/artifacts/
+distro/experiments/
