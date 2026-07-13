@@ -1,7 +1,9 @@
-# Moved
+# Status
 
-Stackwise tracker content lived here by mistake.
+Realm product docs:
 
-See **[distro/STATUS.stackwise.md](distro/STATUS.stackwise.md)**.
-
-Realm OS docs: [docs/architecture.md](docs/architecture.md), [docs/process-contract.md](docs/process-contract.md), [agent.md](agent.md).
+- [docs/architecture.md](docs/architecture.md)
+- [docs/process-contract.md](docs/process-contract.md)
+- [docs/http-gateway.md](docs/http-gateway.md)
+- [agent.md](agent.md)
+- [ORCHESTRATION.md](ORCHESTRATION.md)

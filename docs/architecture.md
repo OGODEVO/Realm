@@ -41,7 +41,6 @@ name is not the product name; do not rename it casually.
 │  boot/docker-compose.yml · launchers · realm.sh shell       │
 └─────────────────────────────────────────────────────────────┘
 
-distro/  — non-kernel experiments / artifacts (not product surface)
 ```
 
 | OS idea | Realm piece | Paths |
@@ -50,11 +49,10 @@ distro/  — non-kernel experiments / artifacts (not product surface)
 | **Bus** | NATS | `boot/docker-compose.yml`, `REALM_NATS_URL` |
 | **Process table** | Registry + Postgres | `services/registry/main.py`, registry client in `src/agentnet/registry.py` |
 | **Drivers** | MCP servers + mesh tools | `drivers/mcp/`, `tools/*` (mesh); `mcp-server/` stubs |
-| **Processes** | Agents / workers | `examples/*_realm_agent.py`, `services/agent-template/`, mesh agents |
+| **Processes** | Agents / workers | `examples/*_realm_agent.py`, `services/agent-template/` |
 | **Init** | Compose + agent homes / launcher | `boot/`, `services/agent-template/`, `drivers/mcp/realm-agent-launcher.py` |
-| **Userland / apps** | HTTP gateway, Telegram, demos | `apps/gateway/`, `src/agentnet/telegram_gateway.py`, `services/gateway/` |
+| **Userland / apps** | HTTP gateway, Telegram, demos | `apps/gateway/`, `apps/demo/`, `src/agentnet/telegram_gateway.py` |
 | **Shell** | Ops CLI | `boot/realm.sh`, `boot/network.sh`, `python -m agentnet` |
-| **Distro** | Experiments / data one-offs | `distro/` |
 
 ---
 
