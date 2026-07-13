@@ -1,0 +1,36 @@
+%% Realm OS — Business Bus
+flowchart LR
+  subgraph OUT["Outside world"]
+    C[Clients / partners]
+    W[Webhooks]
+    E[Engineers curl]
+  end
+
+  subgraph GW["Gateway app"]
+    A[API key auth]
+    V[Validate]
+    P[Publish only — no LLM]
+  end
+
+  subgraph BUS["Kernel bus"]
+    N[NATS subjects]
+    I[account.*.inbox]
+    R[Registry + Postgres]
+  end
+
+  subgraph AG["Agents / processes"]
+    S[Specialist workers]
+    T[Tools only side effects]
+    X[Escalate if needed]
+  end
+
+  C --> A
+  W --> A
+  E --> A
+  A --> V --> P
+  P -->|delegate_task| N
+  N --> I
+  I --> S
+  S --> T
+  S --> X
+  R -.->|presence jobs status| S

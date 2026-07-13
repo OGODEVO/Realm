@@ -25,6 +25,7 @@ try:
     from agentnet.sdk import AgentSDK
     from agentnet.task_protocol import (
         TASK_ASSIGN,
+        build_task_progress,
         build_task_result,
         task_type,
     )
@@ -34,6 +35,7 @@ except ModuleNotFoundError:
     from agentnet.sdk import AgentSDK
     from agentnet.task_protocol import (
         TASK_ASSIGN,
+        build_task_progress,
         build_task_result,
         task_type,
     )
@@ -53,7 +55,9 @@ OPENCODE_PASS = os.getenv("OPENCODE_SERVER_PASSWORD",  "")
 OPENCODE_MODEL= os.getenv("OPENCODE_MODEL",     "")
 OPENCODE_AGENT= os.getenv("OPENCODE_AGENT",     "build")
 OPENCODE_DIR  = os.getenv("OPENCODE_DIR",       os.getcwd())
-OPENCODE_TMO  = float(os.getenv("OPENCODE_TIMEOUT", "180"))
+OPENCODE_TMO  = float(os.getenv("OPENCODE_TIMEOUT", "1800"))
+# Node-level handler budget must outlive OpenCode. Short budgets cancel long jobs mid-flight.
+WORK_TIMEOUT  = float(os.getenv("REALM_WORK_TIMEOUT_SECONDS", "86400"))
 
 BLOB_DIR      = os.getenv("REALM_BLOB_DIR") or None
 SYSTEM_PROMPT = os.getenv(
@@ -198,10 +202,57 @@ def is_from_teammate(msg: Any) -> bool:
 
 def _progress_json(subtype: str, text: str, task_id: str = "",
                    visible: bool = False) -> str:
+    """Legacy chat-shaped progress (non-task messages only)."""
     return json.dumps({
         "type": "progress", "subtype": subtype, "text": text,
         "task_id": task_id, "visible_by_default": visible,
     })
+
+
+def _clip(text: str, limit: int = 400) -> str:
+    value = " ".join(str(text or "").split())
+    if len(value) <= limit:
+        return value
+    return value[: max(0, limit - 1)] + "…"
+
+
+async def emit_progress(
+    sdk: AgentSDK | None,
+    to_agent: str,
+    *,
+    thread_id: str,
+    task_id: str,
+    text: str,
+    phase: str = "working",
+    percent: float | int | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Emit registry-visible task.progress when task_id is known; else chat progress."""
+    if not sdk or not to_agent:
+        return
+    body = _clip(text, 500)
+    if not body:
+        return
+    try:
+        if task_id:
+            await sdk.report_progress(
+                to_agent,
+                task_id,
+                body,
+                thread_id=thread_id or None,
+                percent=percent,
+                phase=phase,
+                metadata=metadata,
+                require_delivery_ack=False,
+            )
+        else:
+            await sdk.send_text(
+                to_agent,
+                _progress_json(phase, body, visible=True),
+                thread_id=thread_id or None,
+            )
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -234,11 +285,66 @@ async def communicate_with_timeout(
         raise
 
 
-async def poll_and_stream(session_id: str, sdk: AgentSDK,
-                          to_agent: str, thread_id: str,
-                          done: asyncio.Event) -> None:
-    """Export-poll for new text/reasoning and post structured progress."""
+def _part_progress_event(part: dict[str, Any]) -> tuple[str, str] | None:
+    """Map an OpenCode export part to (phase, text) for network progress."""
+    ptype = str(part.get("type") or "").strip().lower()
+    if ptype in {"reasoning", "thinking"}:
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            return "thinking", _clip(text, 280)
+        return None
+    if ptype in {"text", "message"}:
+        text = part.get("text")
+        if isinstance(text, str) and text.strip():
+            cleaned = clean_task_answer(text)
+            if cleaned:
+                return "text", _clip(cleaned, 400)
+        return None
+    if ptype in {"tool", "tool_call", "tool-call", "function", "function_call"}:
+        fn = part.get("function") if isinstance(part.get("function"), dict) else {}
+        name = (
+            part.get("name")
+            or part.get("tool")
+            or part.get("toolName")
+            or fn.get("name")
+            or "tool"
+        )
+        status = part.get("status") or part.get("state") or ""
+        detail = part.get("input") or part.get("arguments") or part.get("args") or part.get("text") or ""
+        if isinstance(detail, (dict, list)):
+            detail = json.dumps(detail, default=str)
+        detail_s = _clip(str(detail), 180)
+        label = str(name)
+        if status:
+            label = f"{name} ({status})"
+        if detail_s:
+            label = f"{label}: {detail_s}"
+        return "tool", label
+    # Generic fallback for unknown structured parts with a name.
+    name = part.get("name") or part.get("tool")
+    if name:
+        return "tool", _clip(str(name), 200)
+    text = part.get("text")
+    if isinstance(text, str) and text.strip() and ptype:
+        return ptype, _clip(text, 300)
+    return None
+
+
+async def poll_and_stream(
+    session_id: str,
+    sdk: AgentSDK,
+    to_agent: str,
+    thread_id: str,
+    done: asyncio.Event,
+    *,
+    task_id: str = "",
+) -> None:
+    """Export-poll for tool/text activity and post registry-visible progress."""
     seen: set[str] = set()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    last_emit = started
+    heartbeat_s = float(os.getenv("REALM_PROGRESS_HEARTBEAT_S", "30"))
     while not done.is_set():
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -274,28 +380,40 @@ async def poll_and_stream(session_id: str, sdk: AgentSDK,
                 for part in (msg.get("parts") or []):
                     if not isinstance(part, dict):
                         continue
-                    ptype = part.get("type", "")
-                    text  = part.get("text", "")
-                    if not isinstance(text, str) or not text:
+                    event = _part_progress_event(part)
+                    if event is None:
                         continue
-                    if ptype == "text":
-                        text = clean_task_answer(text)
-                        if not text:
-                            continue
-                    key = f"{ptype}:{hash(text)}"
+                    phase, text = event
+                    key = f"{phase}:{hash(text)}"
                     if key in seen:
                         continue
                     seen.add(key)
-                    is_visible = ptype != "reasoning"
-                    subtype = {"reasoning": "thinking",
-                               "text": "text"}.get(ptype, ptype)
-                    try:
-                        await sdk.send_text(to_agent,
-                            _progress_json(subtype, text,
-                                           visible=is_visible),
-                            thread_id=thread_id)
-                    except Exception:
-                        pass
+                    # Skip pure thinking noise unless no task (chat) — still useful lightly.
+                    if phase == "thinking" and task_id:
+                        continue
+                    last_emit = loop.time()
+                    await emit_progress(
+                        sdk,
+                        to_agent,
+                        thread_id=thread_id,
+                        task_id=task_id,
+                        text=text,
+                        phase=phase,
+                        metadata={"source": "opencode-export", "part_type": phase},
+                    )
+            # Heartbeat when tools go silent for too long.
+            if task_id and heartbeat_s > 0 and (loop.time() - last_emit) >= heartbeat_s:
+                elapsed = int(loop.time() - started)
+                last_emit = loop.time()
+                await emit_progress(
+                    sdk,
+                    to_agent,
+                    thread_id=thread_id,
+                    task_id=task_id,
+                    text=f"HEARTBEAT: still running (opencode, {elapsed}s elapsed)",
+                    phase="status",
+                    metadata={"source": "opencode-export", "heartbeat": True, "elapsed_s": elapsed},
+                )
         except Exception:
             pass
         await asyncio.sleep(EXPORT_POLL_S)
@@ -351,7 +469,8 @@ async def ask_opencode(prompt: str, *,
                        session_map: dict[str, str],
                        sdk: AgentSDK | None = None,
                        to_agent: str = "",
-                       thread_id: str = "") -> str:
+                       thread_id: str = "",
+                       task_id: str = "") -> str:
     cmd = [
         OPENCODE_BIN, "run", "--attach", OPENCODE_URL,
         "--username", OPENCODE_USER,
@@ -387,7 +506,15 @@ async def ask_opencode(prompt: str, *,
     poll_task: asyncio.Task | None = None
     if session_id and sdk and to_agent and thread_id:
         poll_task = asyncio.create_task(
-            poll_and_stream(session_id, sdk, to_agent, thread_id, done))
+            poll_and_stream(
+                session_id,
+                sdk,
+                to_agent,
+                thread_id,
+                done,
+                task_id=task_id,
+            )
+        )
 
     try:
         try:
@@ -486,6 +613,7 @@ async def ask_opencode_resilient(
     sdk: AgentSDK | None = None,
     to_agent: str = "",
     thread_id: str = "",
+    task_id: str = "",
 ) -> str:
     """Retry once with a fresh OpenCode session while preserving the Realm thread."""
     map_key = realm_thread_id or ""
@@ -498,6 +626,7 @@ async def ask_opencode_resilient(
             sdk=sdk,
             to_agent=to_agent,
             thread_id=thread_id,
+            task_id=task_id,
         )
     except Exception as exc:
         if not map_key or not is_recoverable_session_error(exc):
@@ -507,19 +636,14 @@ async def ask_opencode_resilient(
     if existing_session:
         session_map.pop(map_key, None)
         save_session_map(session_map)
-    if sdk and to_agent and thread_id:
-        try:
-            await sdk.send_text(
-                to_agent,
-                _progress_json(
-                    "status",
-                    "Backend session recovered; retrying on the same thread.",
-                    visible=False,
-                ),
-                thread_id=thread_id,
-            )
-        except Exception:
-            pass
+    await emit_progress(
+        sdk,
+        to_agent,
+        thread_id=thread_id,
+        task_id=task_id,
+        text="Backend session recovered; retrying on the same thread.",
+        phase="status",
+    )
     return await ask_opencode(
         prompt,
         realm_thread_id=realm_thread_id,
@@ -527,6 +651,7 @@ async def ask_opencode_resilient(
         sdk=sdk,
         to_agent=to_agent,
         thread_id=thread_id,
+        task_id=task_id,
     )
 
 
@@ -538,6 +663,7 @@ async def ask_opencode_until_complete(
     sdk: AgentSDK | None = None,
     to_agent: str = "",
     thread_id: str = "",
+    task_id: str = "",
 ) -> str:
     """Drive the agent until it explicitly reports completion or blockage."""
     next_prompt = prompt
@@ -549,6 +675,7 @@ async def ask_opencode_until_complete(
             sdk=sdk,
             to_agent=to_agent,
             thread_id=thread_id,
+            task_id=task_id,
         )
         if task_answer_status(answer) is not None:
             return clean_task_answer(answer)
@@ -638,32 +765,40 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
     await update_agent_state("acknowledged", task_id=task_id,
                              thread_id=msg.thread_id,
                              last_action=text.strip()[:200])
-    try:
-        await sdk.send_text(to,
-            _progress_json("status", f"ACK: {text.strip()[:150]}",
-                           task_id, visible=True),
-            thread_id=msg.thread_id)
-    except Exception:
-        pass
+    await emit_progress(
+        sdk,
+        to,
+        thread_id=msg.thread_id or "",
+        task_id=task_id,
+        text=f"ACK: accepted task — {_clip(text, 150)}",
+        phase="ack",
+        percent=1,
+    )
 
     # -- WORKING -------------------------------------------------------------
     await update_agent_state("working", task_id=task_id,
                              thread_id=msg.thread_id)
-    try:
-        await sdk.send_text(to,
-            _progress_json("status", f"WORKING: {text.strip()[:150]}",
-                           task_id, visible=True),
-            thread_id=msg.thread_id)
-    except Exception:
-        pass
+    await emit_progress(
+        sdk,
+        to,
+        thread_id=msg.thread_id or "",
+        task_id=task_id,
+        text=f"WORKING: {_clip(text, 150)}",
+        phase="working",
+        percent=5,
+    )
 
     # -- execute -------------------------------------------------------------
     try:
         task_context = ""
         if is_task_assignment:
+            parent_task = ""
+            if isinstance(msg.payload, dict):
+                parent_task = str(msg.payload.get("parent_task_id") or "")
             task_context = (
                 "\n\nRealm task context:\n"
                 f"- task_id: {task_id}\n"
+                f"- parent_task_id: {parent_task or '(none)'}\n"
                 f"- title: {task_title or '(none)'}\n"
                 f"- thread_id: {msg.thread_id or '(none)'}\n"
                 f"- metadata: {json.dumps(task_metadata, sort_keys=True)}\n"
@@ -672,7 +807,9 @@ async def handle_message(sdk: AgentSDK, session_map: dict[str, str],
             f"{SYSTEM_PROMPT}\n\n{EXECUTION_CONTRACT}{task_context}\n\nRequest:\n{text}",
             realm_thread_id=task_session,
             session_map=session_map,
-            sdk=sdk, to_agent=to, thread_id=msg.thread_id)
+            sdk=sdk, to_agent=to, thread_id=msg.thread_id or "",
+            task_id=task_id,
+        )
         await update_agent_state("done", task_id=task_id,
                                  last_action=answer[:200])
         payload = (
@@ -735,12 +872,14 @@ async def main() -> None:
         nats_url   = NATS_URL,
         blob_store_dir = BLOB_DIR,
         heartbeat_interval = 12.0,
-        work_timeout_seconds = max(OPENCODE_TMO + 30.0, 60.0),
+        # Must exceed longest job. Default 24h — short values kill long agentic work.
+        work_timeout_seconds = max(WORK_TIMEOUT, OPENCODE_TMO + 60.0, 60.0),
         metadata   = {
             "kind": "opencode-llm-agent",
             "opencode_url": OPENCODE_URL,
             "opencode_dir": OPENCODE_DIR,
             "opencode_model": OPENCODE_MODEL,
+            "emits_task_progress": True,
         },
     )
 

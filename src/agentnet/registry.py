@@ -614,6 +614,7 @@ async def list_tasks(
     assignee_account_id: str | None = None,
     coordinator_account_id: str | None = None,
     status: str | None = None,
+    parent_task_id: str | None = None,
     limit: int = 20,
     timeout: float = 2.0,
 ) -> list[dict[str, Any]]:
@@ -633,6 +634,7 @@ async def list_tasks(
             assignee_account_id=assignee_account_id,
             coordinator_account_id=coordinator_account_id,
             status=status,
+            parent_task_id=parent_task_id,
             limit=limit,
             timeout=timeout,
         )
@@ -646,6 +648,7 @@ async def list_tasks_with_client(
     assignee_account_id: str | None = None,
     coordinator_account_id: str | None = None,
     status: str | None = None,
+    parent_task_id: str | None = None,
     limit: int = 20,
     timeout: float = 2.0,
 ) -> list[dict[str, Any]]:
@@ -656,6 +659,8 @@ async def list_tasks_with_client(
         payload["coordinator_account_id"] = str(coordinator_account_id).strip()
     if status:
         payload["status"] = str(status).strip()
+    if parent_task_id:
+        payload["parent_task_id"] = str(parent_task_id).strip()
     try:
         response = await nc.request(REGISTRY_TASK_LIST_SUBJECT, encode_json(payload), timeout=timeout)
     except TimeoutError as exc:
@@ -670,6 +675,132 @@ async def list_tasks_with_client(
     if not isinstance(tasks, list):
         return []
     return [item for item in tasks if isinstance(item, dict)]
+
+
+def _normalize_status_target(target: str) -> tuple[str, str]:
+    normalized = str(target or "").strip()
+    if not normalized:
+        raise ValueError("target is required")
+    lowered = normalized.lower()
+    if lowered.startswith("account:") or normalized.startswith("acct_"):
+        account_id = normalized.split(":", 1)[-1].strip() if ":" in normalized else normalized
+        if not account_id:
+            raise ValueError("account target cannot be empty")
+        return "account", account_id
+    username = normalized[1:] if normalized.startswith("@") else normalized
+    username = username.strip()
+    if not username:
+        raise ValueError("username target cannot be empty")
+    return "username", username
+
+
+def _agent_status_summary(
+    *,
+    label: str,
+    online: bool,
+    active_tasks: list[dict[str, Any]],
+) -> str:
+    if not online:
+        return f"{label} is offline"
+    if not active_tasks:
+        return f"{label} is online and idle"
+    top = active_tasks[0]
+    title = str(top.get("title") or top.get("assigned_text") or top.get("task_id") or "a task").strip()
+    status = str(top.get("status") or "working").strip()
+    progress = str(top.get("latest_progress_text") or "").strip()
+    if progress:
+        return f"{label} is {status} on {title}: {progress}"
+    return f"{label} is {status} on {title}"
+
+
+async def get_agent_status(
+    nats_url: str,
+    target: str,
+    *,
+    limit: int = 10,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    """What is this agent doing? Presence + active/recent tasks + one-line summary."""
+    nc = NATS()
+    try:
+        await nc.connect(
+            servers=[nats_url],
+            allow_reconnect=False,
+            max_reconnect_attempts=0,
+            connect_timeout=timeout,
+        )
+    except (NoServersError, OSError) as exc:
+        raise ConnectionError(f"Cannot connect to NATS at {nats_url}. Is it running?") from exc
+    try:
+        return await get_agent_status_with_client(nc, target, limit=limit, timeout=timeout)
+    finally:
+        await nc.drain()
+
+
+async def get_agent_status_with_client(
+    nc: NATS,
+    target: str,
+    *,
+    limit: int = 10,
+    timeout: float = 2.0,
+) -> dict[str, Any]:
+    kind, value = _normalize_status_target(target)
+    account_id: str | None = None
+    username: str | None = None
+    display = f"@{value}" if kind == "username" else value
+
+    if kind == "account":
+        account_id = value
+    else:
+        username = value
+        try:
+            account_id, username = await resolve_account_by_username_with_client(
+                nc, username=username, timeout=timeout
+            )
+            display = f"@{username}"
+        except Exception:
+            account_id = None
+
+    online_agents = await list_online_agents_with_client(nc, timeout=timeout)
+    matching = []
+    for agent in online_agents:
+        if account_id and agent.account_id == account_id:
+            matching.append(agent)
+        elif username and (agent.username or "").lower() == username.lower():
+            matching.append(agent)
+            if not account_id and agent.account_id:
+                account_id = agent.account_id
+
+    online = bool(matching)
+    session_count = 0
+    if matching:
+        session_count = int((matching[0].metadata or {}).get("session_count") or len(matching))
+        if not account_id:
+            account_id = matching[0].account_id
+        if not username:
+            username = matching[0].username
+
+    recent_tasks: list[dict[str, Any]] = []
+    if account_id:
+        recent_tasks = await list_tasks_with_client(
+            nc,
+            assignee_account_id=account_id,
+            limit=max(1, min(int(limit), 50)),
+            timeout=timeout,
+        )
+    active_tasks = [task for task in recent_tasks if not bool(task.get("terminal"))]
+    summary = _agent_status_summary(label=display, online=online, active_tasks=active_tasks)
+    return {
+        "ok": True,
+        "target": display,
+        "username": username,
+        "account_id": account_id,
+        "online": online,
+        "session_count": session_count,
+        "active_tasks": active_tasks,
+        "recent_tasks": recent_tasks,
+        "summary": summary,
+    }
 
 
 async def get_registry_metrics(
