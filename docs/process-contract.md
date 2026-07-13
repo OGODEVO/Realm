@@ -176,7 +176,7 @@ Processes must not own unconstrained side effects.
 - Arbitrary shell without a driver/tool gate
 - Hidden HTTP to production systems with no allowlist
 
-Side effects go through **drivers** (MCP servers, `tools/*`, app services). The
+Side effects go through **drivers** (MCP servers and app services). The
 brain decides; the OS/driver gate executes. See [architecture.md](architecture.md).
 
 ---

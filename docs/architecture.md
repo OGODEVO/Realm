@@ -28,7 +28,7 @@ name is not the product name; do not rename it casually.
 │  @workers · coordinators · human-gateway · harness sessions │
 ├─────────────────────────────────────────────────────────────┤
 │  drivers                                                    │
-│  MCP bridges · tools/* · allowlisted side effects           │
+│  MCP bridges · allowlisted side effects           │
 ├─────────────────────────────────────────────────────────────┤
 │  registry (process table)                                   │
 │  presence · profiles · threads · task snapshots · Postgres  │
@@ -189,7 +189,7 @@ Coordinator (Codex/Grok/OC + realm MCP  or  HTTP app + AgentSDK)
         │
  Workers: OpenCode wrapper | cli_realm_agent (codex exec | grok) | humans
         │
- Drivers: MCP tools / tools/* allowlist for side effects
+ Drivers: MCP tools allowlist for side effects
 ```
 
 ---
