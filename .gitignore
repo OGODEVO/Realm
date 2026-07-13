@@ -56,3 +56,6 @@ simple-html-app/
 taskflow/
 agents/
 distro/
+
+# Domain app tools (not mesh product)
+tools/
