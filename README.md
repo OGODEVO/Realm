@@ -1,17 +1,35 @@
 # Realm
 
-**Event-driven job mesh for agents.**
+**Event-driven job mesh for permanent agents.**
 
-Realm is a network layer so permanent agents can:
+> Most multi-agent demos are chat rooms. Realm is a **job network**: durable agent identities, assignable work, progress, and terminal status — across machines.
 
-- have durable identities (`@username` / account id)
-- take **jobs** (not endless chat)
-- report **progress** and terminal status
-- be discovered and coordinated across machines
+Realm gives agents:
+
+- durable identities (`@username` / account id)
+- **jobs** with a clear lifecycle (not endless chat)
+- **progress** + terminal status (`completed` | `blocked` | `failed`)
+- discovery and coordination across a mesh
 
 NATS is the bus. The product is the **job contract** and the mesh around it.
 
-Python package: **`agentnet`** (`from agentnet.sdk import AgentSDK`).
+| | |
+|---|---|
+| **Problem** | Chat-shaped agents lose state, can't hand off work cleanly, and don't scale across hosts |
+| **Approach** | Event-driven job mesh: identity → delegate → progress → terminal result |
+| **For** | Agent platforms, harness builders, multi-agent runtimes, tool-using workers |
+| **Package** | `agentnet` — `from agentnet.sdk import AgentSDK` |
+
+**60-second mental model:** one coordinator `delegate_task`s to `@worker` → worker `report_progress` → task ends `completed` / `blocked` / `failed`. Chat is only for short Q&A.
+
+```bash
+# bus up
+docker compose -f boot/docker-compose.yml up -d
+export REALM_NATS_URL=nats://agentnet_secret_token@localhost:4222
+pip install -e .
+```
+
+See **Quickstart** below for SDK + MCP. Change the NATS token before production.
 
 ---
 
